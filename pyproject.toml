@@ -1,0 +1,37 @@
+[project]
+name = "microlog"
+version = "0.1.0"
+description = "microlog is a small lightweight logging library for Python particularly designed for microservices and serverless environments."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chz>=0.3.0",
+]
+
+[project.optional-dependencies]
+opentelemetry = [
+    "opentelemetry-exporter-otlp>=1.37.0",
+    "opentelemetry-sdk>=1.37.0",
+]
+
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+exclude = [".venv", ".pre-commit", ".git", "examples", "tests"]
+stubPath = "microlog/types"
+reportMissingModuleSource = "none"
+
+[tool.uv]
+dev-dependencies = [
+    "pyright>=1.1.406",
+]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+docstring-code-format = true

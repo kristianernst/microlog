@@ -1,0 +1,54 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.137.0
+    command: ["--config=/etc/otelcol-config.yaml"]
+    depends_on:
+      - loki
+    volumes:
+      - ./collector-config.yaml:/etc/otelcol-config.yaml:ro
+    ports:
+      - 4317:4317
+      - 4318:4318
+
+  loki:
+    image: grafana/loki:3.4.4
+    command:
+      - --config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - 3100:3100
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    depends_on:
+      - loki
+    ports:
+      - 3000:3000
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  app:
+    build:
+      context: ../..
+      dockerfile: examples/otel_example/app/Dockerfile
+    depends_on:
+      - otel-collector
+    environment:
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: http://otel-collector:4318/v1/logs
+      PYTHONPATH: /workspace
+    command: ["python", "main.py"]
+    volumes:
+      - ../..:/workspace:ro
+    working_dir: /workspace/examples/otel_example/app
+
+volumes:
+  grafana-data:
+  loki-data:

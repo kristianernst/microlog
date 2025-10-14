@@ -1,0 +1,11 @@
+.venv
+.git
+uv.lock
+.python-version
+__pycache__
+
+.ruff_cache
+.pytest_cache
+
+
+examples/logs
