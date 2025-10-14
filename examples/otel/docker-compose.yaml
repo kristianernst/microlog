@@ -38,7 +38,7 @@ services:
   app:
     build:
       context: ../..
-      dockerfile: examples/otel_example/app/Dockerfile
+      dockerfile: examples/otel/app/Dockerfile
     depends_on:
       - otel-collector
     environment:
@@ -47,7 +47,7 @@ services:
     command: ["python", "main.py"]
     volumes:
       - ../..:/workspace:ro
-    working_dir: /workspace/examples/otel_example/app
+    working_dir: /workspace/examples/otel/app
 
 volumes:
   grafana-data:
