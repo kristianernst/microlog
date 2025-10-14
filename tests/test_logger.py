@@ -3,7 +3,15 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, cast
 
-from microlog import FileConfig, LogConfig, StdoutConfig, configure_logging, get_logger, log_context
+from microlog import (
+    FileConfig,
+    LogConfig,
+    OTLPConfig,
+    StdoutConfig,
+    configure_logging,
+    get_logger,
+    log_context,
+)
 import microlog.logger as microlog_logger
 from microlog.logger import DevColorFormatter, JsonFormatter
 from logging.handlers import RotatingFileHandler
@@ -132,3 +140,67 @@ def test_get_logger_provides_static_metadata() -> None:
     assert isinstance(extra, dict)
     assert extra["service.name"] == cfg.service_name
     assert extra["region"] == "eu-west-1"
+
+
+def test_normalize_protocol_variants() -> None:
+    assert microlog_logger._normalize_protocol("HTTP") == "http/protobuf"  # pyright: ignore[reportPrivateUsage]
+    assert microlog_logger._normalize_protocol("grpc") == "grpc"  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(ValueError):
+        microlog_logger._normalize_protocol("udp")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_resolve_otlp_endpoint_env_precedence(monkeypatch: Any) -> None:
+    otlp_cfg = OTLPConfig(endpoint=None)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    assert (
+        microlog_logger._resolve_otlp_endpoint("http/protobuf", otlp_cfg)  # pyright: ignore[reportPrivateUsage]
+        == "http://localhost:4318/v1/logs"
+    )
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4318/v1/logs")
+    assert (
+        microlog_logger._resolve_otlp_endpoint("http/protobuf", otlp_cfg)  # pyright: ignore[reportPrivateUsage]
+        == "https://collector:4318/v1/logs"
+    )
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://logs-endpoint/v1/logs")
+    assert (
+        microlog_logger._resolve_otlp_endpoint("http/protobuf", otlp_cfg)  # pyright: ignore[reportPrivateUsage]
+        == "https://logs-endpoint/v1/logs"
+    )
+
+
+def test_otlp_handler_configures_when_otel_available(monkeypatch: Any) -> None:
+    try:
+        from opentelemetry.sdk._logs import LoggingHandler as OTLoggingHandler  # type: ignore[import-not-found]
+    except Exception:  # pragma: no cover - optional dependency handling
+        pytest.skip("OpenTelemetry dependencies not installed")
+        return
+
+    class DummyExporter:
+        def shutdown(self) -> None:
+            pass
+
+    class DummyProcessor:
+        def __init__(self, exporter: Any) -> None:
+            self.exporter = exporter
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+        def force_flush(self, timeout_millis: int = 0) -> bool:
+            return True
+
+    monkeypatch.setattr(microlog_logger, "_build_otlp_exporter", lambda *_: DummyExporter())  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        "opentelemetry.sdk._logs.export.BatchLogRecordProcessor", DummyProcessor, raising=False
+    )
+    cfg = LogConfig(
+        stdout=None,
+        file=None,
+        async_mode=False,
+        otlp=OTLPConfig(endpoint="http://localhost:4318/v1/logs"),
+    )
+    configure_logging(cfg)
+    handlers = logging.getLogger().handlers
+    assert any(isinstance(h, OTLoggingHandler) for h in handlers)
