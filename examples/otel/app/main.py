@@ -16,24 +16,29 @@ def main() -> None:
     cfg = LogConfig(
         stdout=StdoutConfig(level="INFO"),
         file=None,
-        async_mode=False,
+        async_mode=True,
+        async_queue_size=2_000,
+        async_queue_drop_oldest=False,
         otlp=OTLPConfig(endpoint=collector_endpoint),
     )
     configure_logging(cfg)
 
-    log = get_logger(__name__, cfg)
-    with log_context(request_id="otel-demo", user="microlog"):
-        log.info("booting collector example", extra={"phase": "start"})
-        try:
-            raise RuntimeError("example error to demonstrate exception logging")
-        except RuntimeError:
-            log.exception("handled runtime error")
-        log.info("completed work cycle", extra={"phase": "finish"})
+    try:
+        log = get_logger(__name__, cfg)
+        with log_context(request_id="otel-demo", user="microlog"):
+            log.info("booting collector example", extra={"phase": "start"})
+            try:
+                raise RuntimeError("example error to demonstrate exception logging")
+            except RuntimeError:
+                log.exception("handled runtime error")
+            log.info("completed work cycle", extra={"phase": "finish"})
 
-    log.info("Miley Cyrus!")
+        log.info("Miley Cyrus!")
 
-    time.sleep(2)
-    logging.shutdown()
+        time.sleep(2)
+    finally:
+        # Ensure the OTLP logger provider/queue flush pending records before exit.
+        logging.shutdown()
 
 
 if __name__ == "__main__":

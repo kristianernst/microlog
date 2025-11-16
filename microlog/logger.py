@@ -1,24 +1,11 @@
-"""Core logging setup and formatters for microlog.
-
-Implements JsonFormatter (OTel‑friendly) and DevColorFormatter (human‑readable),
-plus configure_logging() to wire handlers as per LogConfig.
-"""
-
 from __future__ import annotations
 
-import atexit
-import json
-import logging
-import os
-import re
-import socket
-import sys
-import traceback
+import atexit, json, logging, os, re, socket, sys, traceback
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
-from queue import Queue
-from typing import Any, Dict, Optional, cast
+from queue import Empty, Full, Queue
+from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 from types import MethodType
 from .config import FileConfig, LogConfig, OTLPConfig, StdoutConfig, severity_number
 
@@ -56,93 +43,78 @@ _OTEL_ATTR_MAP = {
 }
 
 
-def _is_tty(stream: Any) -> bool:
-    try:
-        return hasattr(stream, "isatty") and stream.isatty()
-    except Exception:
-        return False
-
-
 def _isoformat(ts: float, use_utc: bool) -> str:
     dt = datetime.fromtimestamp(ts, tz=timezone.utc if use_utc else None)
     s = dt.isoformat()
     return s.replace("+00:00", "Z") if use_utc and s.endswith("+00:00") else s
 
 
-def _format_hex(value: Any, width: int) -> str:
-    return f"{value:0{width}x}" if isinstance(value, int) else str(value)
-
-
 def _extract_otel_context(record: logging.LogRecord, cfg: LogConfig) -> Dict[str, Any]:
-    """Pull trace/span fields from OTel‑instrumented records:contentReference[oaicite:8]{index=8}."""
-    context: Dict[str, Any] = {}
+    ctx: Dict[str, Any] = {}
     for attr, (key, width) in _OTEL_ATTR_MAP.items():
         value = getattr(record, attr, None)
         if value:
-            context[key] = _format_hex(value, width) if width else str(value)
+            ctx[key] = f"{value:0{width}x}" if width and isinstance(value, int) else str(value)
     sampled = getattr(record, "otelTraceSampled", None)
     if sampled is not None:
-        context["trace_sampled"] = bool(sampled)
-    if cfg.try_opentelemetry and not (context.get("trace_id") and context.get("span_id")):
+        ctx["trace_sampled"] = bool(sampled)
+    if cfg.try_opentelemetry and not (ctx.get("trace_id") and ctx.get("span_id")):
         try:
             from opentelemetry.trace import get_current_span  # type: ignore[import-not-found]
 
             span = cast(Any, get_current_span())
-            get_context = getattr(span, "get_span_context", None)
-            sc = get_context() if callable(get_context) else None
+            sc = span.get_span_context() if hasattr(span, "get_span_context") else None
             if sc and getattr(sc, "is_valid", False):
-                trace_id = getattr(sc, "trace_id", None)
-                span_id = getattr(sc, "span_id", None)
-                if trace_id and "trace_id" not in context:
-                    context["trace_id"] = (
+                if (trace_id := getattr(sc, "trace_id", None)) and "trace_id" not in ctx:
+                    ctx["trace_id"] = (
                         f"{trace_id:032x}" if isinstance(trace_id, int) else str(trace_id)
                     )
-                if span_id and "span_id" not in context:
-                    context["span_id"] = (
-                        f"{span_id:016x}" if isinstance(span_id, int) else str(span_id)
-                    )
+                if (span_id := getattr(sc, "span_id", None)) and "span_id" not in ctx:
+                    ctx["span_id"] = f"{span_id:016x}" if isinstance(span_id, int) else str(span_id)
                 flags = int(getattr(sc, "trace_flags", 0))
-                context["trace_sampled"] = bool(int(flags) & 0x01)
+                ctx["trace_sampled"] = bool(flags & 0x01)
         except Exception:
             pass
-    return context
+    return ctx
 
 
-def _redact(value: Any, cfg: LogConfig) -> Any:
-    """Shallow redaction for sensitive keys and regex‑matched values:contentReference[oaicite:9]{index=9}."""
-    if not isinstance(value, dict):
+def _scrub_value(value: Any, keys: set[str], patterns: list[re.Pattern[str]]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "***" if key.lower() in keys else _scrub_value(val, keys, patterns)
+            for key, val in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_scrub_value(item, keys, patterns) for item in value]
+    if isinstance(value, str) and patterns:
+        for pattern in patterns:
+            value = pattern.sub("***", value)
         return value
-    keys = {k.lower() for k in cfg.redact_keys}
-    patterns: list[re.Pattern[str]] = []
-    for pattern in cfg.redact_value_patterns:
+    return value
+
+
+def _json_default(value: Any) -> str:
+    return str(value)
+
+
+def _compile_patterns(patterns: Iterable[str]) -> List[re.Pattern[str]]:
+    compiled: List[re.Pattern[str]] = []
+    for pattern in patterns:
         try:
-            patterns.append(re.compile(pattern))
+            compiled.append(re.compile(pattern))
         except re.error:
             continue
-
-    def _scrub(text: str) -> str:
-        for pattern in patterns:
-            text = pattern.sub("***", text)
-        return text
-
-    return {
-        key: "***"
-        if key.lower() in keys
-        else _scrub(val)
-        if isinstance(val, str) and patterns
-        else val
-        for key, val in cast(Dict[str, Any], value).items()
-    }
+    return compiled
 
 
 class JsonFormatter(logging.Formatter):
-    """Format records as OpenTelemetry‑compatible JSON."""
-
     def __init__(self, cfg: LogConfig):
         super().__init__()
         self.cfg = cfg
         self.hostname = socket.gethostname() if cfg.include_host else None
         self.pid = os.getpid() if cfg.include_pid else None
+        self._keys = {k.lower() for k in cfg.redact_keys}
+        self._patterns = _compile_patterns(cfg.redact_value_patterns)
 
     def format(self, record: logging.LogRecord) -> str:
         cfg = self.cfg
@@ -153,18 +125,16 @@ class JsonFormatter(logging.Formatter):
             "body": record.getMessage(),
             "service.name": cfg.service_name,
         }
-        out.update(
-            {
-                key: value
-                for key, value in {
-                    "service.version": cfg.service_version,
-                    "deployment.environment": cfg.environment,
-                    "host.name": self.hostname,
-                    "process.pid": self.pid,
-                }.items()
-                if value is not None
-            }
-        )
+        if cfg.include_logger_name:
+            out["logger.name"] = record.name
+        for key, value in (
+            ("service.version", cfg.service_version),
+            ("deployment.environment", cfg.environment),
+            ("host.name", self.hostname),
+            ("process.pid", self.pid),
+        ):
+            if value is not None:
+                out[key] = value
         if cfg.include_thread:
             out["thread.name"] = record.threadName
         if cfg.include_code:
@@ -175,12 +145,10 @@ class JsonFormatter(logging.Formatter):
                     "code.line.number": record.lineno,
                 }
             )
-        # OTel context
         out.update(_extract_otel_context(record, cfg))
-        # Merge extras & redact
         extras = {k: v for k, v in record.__dict__.items() if k not in _SKIP_EXTRA_KEYS}
         if extras:
-            out.update(_redact(extras, cfg))
+            out.update(extras)
         if record.exc_info:
             etype, evalue, etb = record.exc_info
             out["exception.type"] = getattr(etype, "__name__", str(etype))
@@ -190,17 +158,17 @@ class JsonFormatter(logging.Formatter):
             ).strip()
         elif record.stack_info:
             out["stack"] = str(record.stack_info)
+        scrubbed = _scrub_value(out, self._keys, self._patterns)
         return json.dumps(
-            {k: v for k, v in out.items() if v is not None},
+            {k: v for k, v in scrubbed.items() if v is not None},
             ensure_ascii=False,
             separators=(",", ":"),
             indent=cfg.json_indent,
+            default=_json_default,
         )
 
 
 class DevColorFormatter(logging.Formatter):
-    """Colourised, single‑line formatter for development:contentReference[oaicite:10]{index=10}."""
-
     _LEVEL_COLORS = {
         logging.DEBUG: 36,
         logging.INFO: 32,
@@ -212,17 +180,42 @@ class DevColorFormatter(logging.Formatter):
     def __init__(self, cfg: LogConfig):
         super().__init__()
         self.cfg = cfg
+        self._patterns = _compile_patterns(cfg.redact_value_patterns)
 
     def format(self, record: logging.LogRecord) -> str:
         ts = _isoformat(record.created, self.cfg.utc)
         color = self._LEVEL_COLORS.get(record.levelno, 37)
         loc = f"{os.path.basename(record.pathname)}:{record.lineno} {record.funcName}()"
-        msg = record.getMessage()
-        parts = [f"{ts} \x1b[{color}m{record.levelname}\x1b[0m {record.name} - {msg} [{loc}]"]
+        msg = _scrub_value(record.getMessage(), set(), self._patterns)
+        name = record.name if self.cfg.include_logger_name else self.cfg.service_name
+        parts = [f"{ts} \x1b[{color}m{record.levelname}\x1b[0m {name} - {msg} [{loc}]"]
         ctx = _extract_otel_context(record, self.cfg)
         if ctx.get("trace_id"):
             parts.append(f"(trace_id={ctx['trace_id']} span_id={ctx.get('span_id')})")
         return " ".join(parts)
+
+
+class _BoundedQueueHandler(QueueHandler):
+    """QueueHandler that applies a bounded queue with drop policies."""
+
+    def __init__(self, queue: Queue[logging.LogRecord], drop_oldest: bool):
+        super().__init__(queue)
+        self._drop_oldest = drop_oldest
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except Full:
+            if self._drop_oldest:
+                try:
+                    self.queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self.queue.put_nowait(record)
+                except Full:
+                    pass
+            # Drop newest if not removing oldest; swallow the exception to avoid spamming stderr
 
 
 _listener: Optional[QueueListener] = None
@@ -243,7 +236,12 @@ atexit.register(_stop_listener)
 
 def _apply_format(handler: logging.Handler, cfg: LogConfig) -> None:
     stream = getattr(handler, "stream", None)
-    use_color = bool(stream) and cfg.dev_color and _is_tty(stream)
+    use_color = False
+    if stream and cfg.dev_color:
+        try:
+            use_color = bool(getattr(stream, "isatty", lambda: False)())
+        except Exception:
+            pass
     handler.setFormatter(DevColorFormatter(cfg) if use_color else JsonFormatter(cfg))
 
 
@@ -307,11 +305,14 @@ def _resolve_otlp_endpoint(protocol: str, otlp_cfg: OTLPConfig) -> str:
     return "http://localhost:4318/v1/logs" if protocol == "http/protobuf" else "localhost:4317"
 
 
-def _build_otlp_exporter(protocol: str, otlp_cfg: OTLPConfig):
+def _build_otlp_exporter(
+    protocol: str, otlp_cfg: OTLPConfig
+) -> tuple[Any, Optional[Callable[[], None]]]:
     endpoint = _resolve_otlp_endpoint(protocol, otlp_cfg)
     headers = dict(otlp_cfg.headers) if otlp_cfg.headers else None
     compression = otlp_cfg.compression
     timeout = otlp_cfg.timeout
+    cleanup: Optional[Callable[[], None]] = None
     if protocol == "http/protobuf":
         try:
             from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
@@ -336,7 +337,9 @@ def _build_otlp_exporter(protocol: str, otlp_cfg: OTLPConfig):
             session = requests.Session()
             session.verify = False
             kwargs["session"] = session
-        return OTLPLogExporter(**kwargs)
+            cleanup = session.close
+        exporter = OTLPLogExporter(**kwargs)
+        return exporter, cleanup
     try:
         from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
     except Exception as exc:  # pragma: no cover - optional dependency handling
@@ -350,7 +353,8 @@ def _build_otlp_exporter(protocol: str, otlp_cfg: OTLPConfig):
         kwargs["compression"] = compression
     if timeout is not None:
         kwargs["timeout"] = float(timeout)
-    return OTLPLogExporter(**kwargs)
+    exporter = OTLPLogExporter(**kwargs)
+    return exporter, None
 
 
 def _otlp_resource_attributes(cfg: LogConfig, otlp_cfg: OTLPConfig) -> Dict[str, Any]:
@@ -365,7 +369,7 @@ def _otlp_resource_attributes(cfg: LogConfig, otlp_cfg: OTLPConfig) -> Dict[str,
 
 def _otlp_handler(cfg: LogConfig, otlp_cfg: OTLPConfig) -> logging.Handler:
     protocol = _normalize_protocol(otlp_cfg.protocol)
-    exporter = _build_otlp_exporter(protocol, otlp_cfg)
+    exporter, exporter_cleanup = _build_otlp_exporter(protocol, otlp_cfg)
     try:
         from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
@@ -386,6 +390,15 @@ def _otlp_handler(cfg: LogConfig, otlp_cfg: OTLPConfig) -> logging.Handler:
             original_close()
         except Exception:
             pass
+        try:
+            provider.shutdown()
+        except Exception:
+            pass
+        if exporter_cleanup:
+            try:
+                exporter_cleanup()
+            except Exception:
+                pass
 
     handler.close = MethodType(_safe_close, handler)
     return handler
@@ -409,7 +422,8 @@ def _build_handlers(cfg: LogConfig) -> list[logging.Handler]:
 def configure_logging(cfg: LogConfig) -> None:
     global _listener
     root = logging.getLogger()
-    root.setLevel(getattr(logging, cfg.level.upper(), logging.INFO))
+    root_level = _resolve_level(cfg.level)
+    root.setLevel(root_level if root_level is not None else logging.INFO)
     for h in list(root.handlers):
         root.removeHandler(h)
         try:
@@ -419,8 +433,15 @@ def configure_logging(cfg: LogConfig) -> None:
     _stop_listener()
     handlers = _build_handlers(cfg)
     if cfg.async_mode:
-        q: Queue[logging.LogRecord] = Queue(-1)
-        root.addHandler(QueueHandler(q))
+        maxsize = cfg.async_queue_size if cfg.async_queue_size > 0 else 0
+        q: Queue[logging.LogRecord] = Queue(maxsize)
+        if maxsize > 0:
+            queue_handler: QueueHandler = _BoundedQueueHandler(
+                q, drop_oldest=cfg.async_queue_drop_oldest
+            )
+        else:
+            queue_handler = QueueHandler(q)
+        root.addHandler(queue_handler)
         _listener = QueueListener(q, *handlers, respect_handler_level=True)
         _listener.start()
     else:

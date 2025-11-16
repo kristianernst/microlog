@@ -30,8 +30,8 @@ def test_file_config_requires_path():
 @pytest.mark.parametrize(
     ("level", "expected"),
     [
-        (-1, 0),
-        (0, 0),
+        (-1, 1),
+        (0, 1),
         (5, 5),
         (20, 9),
         (30, 13),

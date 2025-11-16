@@ -27,6 +27,24 @@ with log_context(request_id="req-123"):
     log.info("ready")
 ```
 
+### Asynchronous logging
+
+`LogConfig(async_mode=True)` wires up a background `QueueListener` so writes never block your
+application threads. The queue is bounded by default (`async_queue_size=10_000`) to protect your
+process from backpressure. Tune the queue characteristics to match the workload:
+
+```python
+cfg = LogConfig(
+    async_mode=True,
+    async_queue_size=2_000,
+    async_queue_drop_oldest=True,
+)
+configure_logging(cfg)
+```
+
+Set `async_queue_size=0` to restore the legacy unbounded queue, though this should generally be
+reserved for short-lived scripts where burst loss is unacceptable.
+
 ### OTLP export
 
 Add an `OTLPConfig` to send records to a collector. Environment variables
@@ -42,17 +60,21 @@ cfg = LogConfig(
     )
 )
 configure_logging(cfg)
+logging.shutdown()  # ensure OTLP handlers flush before exit
 ```
+
+See `examples/otel/app/main.py` for a complete script that enables async logging, tunes the queue,
+and shuts down logging to flush the OpenTelemetry `LoggerProvider`.
 
 ### Examples
 
 - `examples/simple/simple_example.py` writes to stdout and a rotating file.
   - cmd: `uv run -m examples.simple.simple_example`
   - or to pass parameters via CLI: `uv run -m examples.simple.simple_example settings.stdout_level=DEBUG settings.enable_file=false`
-- `examples/otel_example` sends OTLP logs to Loki through the OpenTelemetry Collector and Grafana.
+- `examples/otel` sends OTLP logs to Loki through the OpenTelemetry Collector and Grafana.
   - cmd:
     ```bash
-    cd examples/otel_example
+    cd examples/otel
     docker compose up --build
     ```
 

@@ -1,6 +1,7 @@
 import json
 import logging
 from pathlib import Path
+from queue import Queue
 from typing import Any, Dict, List, cast
 
 from microlog import (
@@ -87,6 +88,37 @@ def test_file_logging_writes_json(tmp_path: Path) -> None:
     assert record["team"] == "core"
 
 
+def test_redaction_applies_to_nested_data_and_message(tmp_path: Path) -> None:
+    class Custom:
+        def __str__(self) -> str:
+            return "custom-value"
+
+    log_path = tmp_path / "scrub" / "app.log"
+    cfg = LogConfig(
+        stdout=None,
+        file=FileConfig(path=str(log_path)),
+        async_mode=False,
+        redact_value_patterns=[r"user-\d+"],
+    )
+    configure_logging(cfg)
+    logger = get_logger("svc", cfg)
+    with log_context(session="user-42"):
+        logger.info(
+            "login user-42",
+            extra={
+                "credentials": {"token": "abc", "nested": [{"password": "pw"}]},
+                "custom": Custom(),
+            },
+        )
+    flush_handlers()
+    record = read_json_lines(log_path)[-1]
+    assert record["body"] == "login ***"
+    assert record["session"] == "***"
+    assert record["credentials"]["token"] == "***"
+    assert record["credentials"]["nested"][0]["password"] == "***"
+    assert record["custom"] == "custom-value"
+
+
 def test_stdout_logging_includes_context(capfd) -> None:
     cfg = LogConfig(stdout=StdoutConfig(level="INFO"), file=None, async_mode=False)
     configure_logging(cfg)
@@ -104,10 +136,17 @@ def test_stdout_logging_includes_context(capfd) -> None:
 
 
 def test_dev_color_formatter_applied(monkeypatch) -> None:
-    def always_tty(_: object) -> bool:
-        return True
+    class DummyStdout:
+        def write(self, _: str) -> None:
+            pass
 
-    monkeypatch.setattr("microlog.logger._is_tty", always_tty)
+        def flush(self) -> None:
+            pass
+
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(microlog_logger.sys, "stdout", DummyStdout())
     cfg = LogConfig(stdout=StdoutConfig(), file=None, async_mode=False, dev_color=True)
     configure_logging(cfg)
     handler = logging.getLogger().handlers[0]
@@ -191,7 +230,7 @@ def test_otlp_handler_configures_when_otel_available(monkeypatch: Any) -> None:
         def force_flush(self, timeout_millis: int = 0) -> bool:
             return True
 
-    monkeypatch.setattr(microlog_logger, "_build_otlp_exporter", lambda *_: DummyExporter())  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(microlog_logger, "_build_otlp_exporter", lambda *_: (DummyExporter(), None))  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(
         "opentelemetry.sdk._logs.export.BatchLogRecordProcessor", DummyProcessor, raising=False
     )
@@ -204,3 +243,38 @@ def test_otlp_handler_configures_when_otel_available(monkeypatch: Any) -> None:
     configure_logging(cfg)
     handlers = logging.getLogger().handlers
     assert any(isinstance(h, OTLoggingHandler) for h in handlers)
+
+
+def test_bounded_queue_handler_drops_oldest() -> None:
+    q: Queue[logging.LogRecord] = Queue(maxsize=1)
+    handler = microlog_logger._BoundedQueueHandler(q, drop_oldest=True)  # pyright: ignore[reportPrivateUsage]
+    first = logging.makeLogRecord({"msg": "first"})
+    second = logging.makeLogRecord({"msg": "second"})
+    handler.enqueue(first)
+    handler.enqueue(second)
+    assert q.qsize() == 1
+    stored = q.get()
+    assert stored.msg == "second"
+
+
+def test_bounded_queue_handler_drops_newest_when_configured() -> None:
+    q: Queue[logging.LogRecord] = Queue(maxsize=1)
+    handler = microlog_logger._BoundedQueueHandler(q, drop_oldest=False)  # pyright: ignore[reportPrivateUsage]
+    first = logging.makeLogRecord({"msg": "first"})
+    second = logging.makeLogRecord({"msg": "second"})
+    handler.enqueue(first)
+    handler.enqueue(second)
+    assert q.qsize() == 1
+    stored = q.get()
+    assert stored.msg == "first"
+
+
+def test_async_queue_configuration_applies_bounded_handler() -> None:
+    cfg = LogConfig(stdout=StdoutConfig(), file=None, async_mode=True, async_queue_size=5)
+    configure_logging(cfg)
+    root = logging.getLogger()
+    assert len(root.handlers) == 1
+    handler = root.handlers[0]
+    assert isinstance(handler, microlog_logger._BoundedQueueHandler)  # pyright: ignore[reportPrivateUsage]
+    assert handler.queue.maxsize == 5
+    microlog_logger._stop_listener()  # pyright: ignore[reportPrivateUsage]
