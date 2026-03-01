@@ -4,13 +4,23 @@ microlog provides JSON logging, context propagation, and optional OTLP export fo
 
 ### Installation
 
-Install the project and the OpenTelemetry extras with [uv](https://github.com/astral-sh/uv):
+Install core dependencies with [uv](https://github.com/astral-sh/uv):
+
+```bash
+uv sync
+```
+
+Install OTLP support when needed:
 
 ```bash
 uv sync --extra opentelemetry
 ```
 
-The command makes the `microlog` package available and installs the OTLP exporter and SDK.
+Install max-throughput JSON serialization when needed:
+
+```bash
+uv sync --extra performance
+```
 
 ### Basic use
 
@@ -26,6 +36,23 @@ log = get_logger(__name__, cfg)
 with log_context(request_id="req-123"):
     log.info("ready")
 ```
+
+For production defaults across microservices, use the preset:
+
+```python
+from microlog import production_config, configure_logging
+
+cfg = production_config(
+    "orders",
+    environment="prod",
+    enable_otlp=True,
+    otlp_endpoint="http://otel-collector:4318/v1/logs",
+)
+configure_logging(cfg)
+```
+
+`production_config` enables adaptive load shedding defaults for low-severity logs under queue
+pressure (`shed_below_level="WARNING"`, `shed_when_queue_above=0.85`, `shed_rate=0.2`).
 
 ### Asynchronous logging
 
@@ -44,6 +71,42 @@ configure_logging(cfg)
 
 Set `async_queue_size=0` to restore the legacy unbounded queue, though this should generally be
 reserved for short-lived scripts where burst loss is unacceptable.
+
+### Production profile
+
+- Use `async_mode=True` with a bounded queue.
+- Enable OTLP only when you need collector export.
+- Install the `performance` extra to use `orjson` for faster serialization.
+- Call `logging.shutdown()` on process exit to flush handlers.
+- Track logger health via `get_runtime_stats()` to detect dropped records.
+- Export logger health to OpenTelemetry metrics with `enable_otel_runtime_metrics()`.
+- Keep `otlp_fail_open=True` for graceful startup when collector is unavailable.
+
+### Runtime health stats
+
+```python
+from microlog import get_runtime_stats
+
+stats = get_runtime_stats()
+# RuntimeStats(queued_records=..., dropped_records=..., dropped_oldest_records=...)
+```
+
+### OTel runtime metrics
+
+```python
+from microlog import enable_otel_runtime_metrics
+
+enabled = enable_otel_runtime_metrics(attributes={"service.name": "orders"})
+```
+
+When enabled, microlog publishes:
+- `microlog_queued_records_total`
+- `microlog_dropped_records_total`
+- `microlog_shed_records_total`
+- `microlog_queue_size`
+- `microlog_queue_maxsize`
+
+See `/Users/kristianernst/Work/Learning/projects/serious/microlog/docs/alerting.md` for a minimal alerting spec.
 
 ### OTLP export
 
@@ -70,7 +133,6 @@ and shuts down logging to flush the OpenTelemetry `LoggerProvider`.
 
 - `examples/simple/simple_example.py` writes to stdout and a rotating file.
   - cmd: `uv run -m examples.simple.simple_example`
-  - or to pass parameters via CLI: `uv run -m examples.simple.simple_example settings.stdout_level=DEBUG settings.enable_file=false`
 - `examples/otel` sends OTLP logs to Loki through the OpenTelemetry Collector and Grafana.
   - cmd:
     ```bash
@@ -88,6 +150,10 @@ and shuts down logging to flush the OpenTelemetry `LoggerProvider`.
 - Run tests:
   ```bash
   uv run pytest
+  ```
+- Run performance guard:
+  ```bash
+  uv run python benchmarks/benchmark.py --count 20000 --min-sync-rps 2500 --min-async-rps 2500 --max-drop-rate 0.05
   ```
 
 ### Contribution guidelines

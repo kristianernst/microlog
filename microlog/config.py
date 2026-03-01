@@ -1,85 +1,111 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Set
 
-try:
-    from chz import chz, field
-except Exception as exc:  # pragma: no cover
-    raise ImportError("chz is required: https://github.com/openai/chz") from exc
+from dataclasses import dataclass, field
+from typing import Any
+
+DEFAULT_REDACT_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "auth",
+    }
+)
 
 
-@chz
+def _redact_keys() -> set[str]:
+    return set(DEFAULT_REDACT_KEYS)
+
+
+def _str_list() -> list[str]:
+    return []
+
+
+def _str_map() -> dict[str, str]:
+    return {}
+
+
+def _any_map() -> dict[str, Any]:
+    return {}
+
+
+@dataclass(frozen=True, slots=True)
 class StdoutConfig:
-    level: Optional[str] = field(default=None)
+    level: str | int | None = None
 
 
-@chz
+@dataclass(frozen=True, slots=True)
 class FileConfig:
-    path: str = field()
-    rotate_bytes: Optional[int] = field(default=None)
-    rotate_backups: int = field(default=5)
-    level: Optional[str] = field(default=None)
+    path: str
+    rotate_bytes: int | None = None
+    rotate_backups: int = 5
+    level: str | int | None = None
 
 
-@chz
+@dataclass(frozen=True, slots=True)
 class OTLPConfig:
-    protocol: str = field(default="http/protobuf")
-    endpoint: Optional[str] = field(default=None)
-    insecure: bool = field(default=True)
-    headers: Dict[str, str] = field(default_factory=dict)
-    compression: Optional[str] = field(default=None)
-    timeout: Optional[float] = field(default=None)
-    level: Optional[str] = field(default=None)
-    resource_attributes: Dict[str, Any] = field(default_factory=dict)
+    protocol: str = "http/protobuf"
+    endpoint: str | None = None
+    insecure: bool = True
+    headers: dict[str, str] = field(default_factory=_str_map)
+    compression: str | None = None
+    timeout: float | None = None
+    level: str | int | None = None
+    resource_attributes: dict[str, Any] = field(default_factory=_any_map)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", dict(self.headers))
+        object.__setattr__(self, "resource_attributes", dict(self.resource_attributes))
 
 
-@chz
+@dataclass(frozen=True, slots=True)
 class LogConfig:
-    service_name: str = field(default="app")
-    service_version: Optional[str] = field(default=None)
-    environment: Optional[str] = field(default=None)
-    stdout: Optional[StdoutConfig] = field(default_factory=StdoutConfig)
-    file: Optional[FileConfig] = field(default=None)
-    otlp: Optional[OTLPConfig] = field(default=None)
-    level: str = field(default="INFO")
-    utc: bool = field(default=True)
-    async_mode: bool = field(default=True)
-    async_queue_size: int = field(default=10000)
-    async_queue_drop_oldest: bool = field(default=True)
-    json_indent: Optional[int] = field(default=None)
-    dev_color: bool = field(default=False)
-    include_logger_name: bool = field(default=True)
-    include_thread: bool = field(default=False)
-    include_pid: bool = field(default=True)
-    include_host: bool = field(default=True)
-    include_code: bool = field(default=True)
-    try_opentelemetry: bool = field(default=True)
-    static: Dict[str, Any] = field(default_factory=dict)
-    redact_keys: Set[str] = field(
-        default_factory=lambda: {
-            "password",
-            "passwd",
-            "secret",
-            "token",
-            "api_key",
-            "apikey",
-            "authorization",
-            "auth",
-        }
-    )
-    redact_value_patterns: List[str] = field(default_factory=list)
+    service_name: str = "app"
+    service_version: str | None = None
+    environment: str | None = None
+    stdout: StdoutConfig | None = field(default_factory=StdoutConfig)
+    file: FileConfig | None = None
+    otlp: OTLPConfig | None = None
+    otlp_fail_open: bool = True
+    level: str | int = "INFO"
+    utc: bool = True
+    async_mode: bool = True
+    async_queue_size: int = 10000
+    async_queue_drop_oldest: bool = True
+    shed_below_level: str | int | None = None
+    shed_when_queue_above: float = 0.9
+    shed_rate: float = 1.0
+    json_indent: int | None = None
+    dev_color: bool = False
+    include_logger_name: bool = True
+    include_thread: bool = False
+    include_pid: bool = True
+    include_host: bool = True
+    include_code: bool = True
+    try_opentelemetry: bool = True
+    static: dict[str, Any] = field(default_factory=_any_map)
+    redact_keys: set[str] = field(default_factory=_redact_keys)
+    redact_value_patterns: list[str] = field(default_factory=_str_list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "static", dict(self.static))
+        object.__setattr__(self, "redact_keys", set(self.redact_keys))
+        object.__setattr__(self, "redact_value_patterns", list(self.redact_value_patterns))
 
 
 def severity_number(levelno: int) -> int:
-    """Map stdlib logging levels to OpenTelemetry severity_number values (1-24)."""
-
     if levelno <= 0:
-        return 1  # TRACE
+        return 1
     if levelno < 20:
-        return 5  # DEBUG
+        return 5
     if levelno < 30:
-        return 9  # INFO
+        return 9
     if levelno < 40:
-        return 13  # WARN
+        return 13
     if levelno < 50:
-        return 17  # ERROR
-    return 21  # FATAL
+        return 17
+    return 21

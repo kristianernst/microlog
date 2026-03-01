@@ -1,5 +1,7 @@
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from queue import Queue
 from typing import Any, Dict, List, cast
@@ -10,8 +12,10 @@ from microlog import (
     OTLPConfig,
     StdoutConfig,
     configure_logging,
+    get_runtime_stats,
     get_logger,
     log_context,
+    reset_runtime_stats,
 )
 import microlog.logger as microlog_logger
 from microlog.logger import DevColorFormatter, JsonFormatter
@@ -246,6 +250,7 @@ def test_otlp_handler_configures_when_otel_available(monkeypatch: Any) -> None:
 
 
 def test_bounded_queue_handler_drops_oldest() -> None:
+    reset_runtime_stats()
     q: Queue[logging.LogRecord] = Queue(maxsize=1)
     handler = microlog_logger._BoundedQueueHandler(q, drop_oldest=True)  # pyright: ignore[reportPrivateUsage]
     first = logging.makeLogRecord({"msg": "first"})
@@ -255,9 +260,14 @@ def test_bounded_queue_handler_drops_oldest() -> None:
     assert q.qsize() == 1
     stored = q.get()
     assert stored.msg == "second"
+    stats = get_runtime_stats()
+    assert stats.queued_records == 2
+    assert stats.dropped_records == 1
+    assert stats.dropped_oldest_records == 1
 
 
 def test_bounded_queue_handler_drops_newest_when_configured() -> None:
+    reset_runtime_stats()
     q: Queue[logging.LogRecord] = Queue(maxsize=1)
     handler = microlog_logger._BoundedQueueHandler(q, drop_oldest=False)  # pyright: ignore[reportPrivateUsage]
     first = logging.makeLogRecord({"msg": "first"})
@@ -267,6 +277,10 @@ def test_bounded_queue_handler_drops_newest_when_configured() -> None:
     assert q.qsize() == 1
     stored = q.get()
     assert stored.msg == "first"
+    stats = get_runtime_stats()
+    assert stats.queued_records == 1
+    assert stats.dropped_records == 1
+    assert stats.dropped_oldest_records == 0
 
 
 def test_async_queue_configuration_applies_bounded_handler() -> None:
@@ -278,3 +292,145 @@ def test_async_queue_configuration_applies_bounded_handler() -> None:
     assert isinstance(handler, microlog_logger._BoundedQueueHandler)  # pyright: ignore[reportPrivateUsage]
     assert handler.queue.maxsize == 5
     microlog_logger._stop_listener()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_runtime_stats_track_unbounded_async_queue(tmp_path: Path) -> None:
+    reset_runtime_stats()
+    log_path = tmp_path / "runtime" / "app.log"
+    cfg = LogConfig(
+        stdout=None,
+        file=FileConfig(path=str(log_path)),
+        async_mode=True,
+        async_queue_size=0,
+    )
+    configure_logging(cfg)
+    logger = get_logger(None, cfg)
+    logger.info("runtime")
+    stats = get_runtime_stats()
+    assert stats.queued_records >= 1
+    assert stats.dropped_records == 0
+    microlog_logger._stop_listener()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_adaptive_shedding_drops_low_severity_under_pressure() -> None:
+    reset_runtime_stats()
+    q: Queue[logging.LogRecord] = Queue(maxsize=10)
+    for i in range(9):
+        q.put(logging.makeLogRecord({"msg": f"prefill-{i}", "levelno": logging.INFO}))
+    handler = microlog_logger._BoundedQueueHandler(  # pyright: ignore[reportPrivateUsage]
+        q,
+        drop_oldest=False,
+        shed_below_level=logging.WARNING,
+        shed_when_queue_above=0.8,
+        shed_rate=0.0,
+    )
+    handler.enqueue(logging.makeLogRecord({"msg": "shed-me", "levelno": logging.INFO}))
+    assert q.qsize() == 9
+    stats = get_runtime_stats()
+    assert stats.shed_records == 1
+    assert stats.dropped_records == 1
+
+
+def test_adaptive_shedding_preserves_high_severity() -> None:
+    reset_runtime_stats()
+    q: Queue[logging.LogRecord] = Queue(maxsize=10)
+    for i in range(9):
+        q.put(logging.makeLogRecord({"msg": f"prefill-{i}", "levelno": logging.INFO}))
+    handler = microlog_logger._BoundedQueueHandler(  # pyright: ignore[reportPrivateUsage]
+        q,
+        drop_oldest=False,
+        shed_below_level=logging.WARNING,
+        shed_when_queue_above=0.8,
+        shed_rate=0.0,
+    )
+    handler.enqueue(logging.makeLogRecord({"msg": "keep-me", "levelno": logging.ERROR}))
+    assert q.qsize() == 10
+    stats = get_runtime_stats()
+    assert stats.shed_records == 0
+    assert stats.queued_records == 1
+
+
+def test_enable_disable_otel_runtime_metrics_no_crash() -> None:
+    enabled = microlog_logger.enable_otel_runtime_metrics()  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(enabled, bool)
+    microlog_logger.disable_otel_runtime_metrics()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_otlp_fail_open_continues_with_other_handlers(monkeypatch: Any) -> None:
+    def _raise_otlp(*_args: Any, **_kwargs: Any) -> logging.Handler:
+        raise RuntimeError("collector down")
+
+    monkeypatch.setattr(microlog_logger, "_otlp_handler", _raise_otlp)  # pyright: ignore[reportPrivateUsage]
+    cfg = LogConfig(
+        stdout=StdoutConfig(level="INFO"),
+        file=None,
+        async_mode=False,
+        otlp=OTLPConfig(endpoint="http://collector:4318/v1/logs"),
+        otlp_fail_open=True,
+    )
+    with pytest.warns(RuntimeWarning, match="OTLP handler setup failed"):
+        configure_logging(cfg)
+    handlers = logging.getLogger().handlers
+    assert handlers
+    assert all(not isinstance(h, logging.NullHandler) for h in handlers)
+
+
+def test_otlp_fail_closed_raises(monkeypatch: Any) -> None:
+    def _raise_otlp(*_args: Any, **_kwargs: Any) -> logging.Handler:
+        raise RuntimeError("collector down")
+
+    monkeypatch.setattr(microlog_logger, "_otlp_handler", _raise_otlp)  # pyright: ignore[reportPrivateUsage]
+    cfg = LogConfig(
+        stdout=StdoutConfig(level="INFO"),
+        file=None,
+        async_mode=False,
+        otlp=OTLPConfig(endpoint="http://collector:4318/v1/logs"),
+        otlp_fail_open=False,
+    )
+    with pytest.raises(RuntimeError, match="collector down"):
+        configure_logging(cfg)
+
+
+def test_async_mode_remains_non_blocking_with_slow_sink(monkeypatch: Any) -> None:
+    class SlowHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            _ = record
+            time.sleep(0.05)
+
+    monkeypatch.setattr(
+        microlog_logger,
+        "_build_handlers",
+        lambda _cfg: [SlowHandler()],
+    )  # pyright: ignore[reportPrivateUsage]
+    cfg = LogConfig(
+        stdout=StdoutConfig(level="INFO"), file=None, async_mode=True, async_queue_size=100
+    )
+    configure_logging(cfg)
+    logger = get_logger(None, cfg)
+    start = time.perf_counter()
+    logger.info("fast path")
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.02
+    microlog_logger._stop_listener()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_stop_listener_is_race_safe(tmp_path: Path) -> None:
+    log_path = tmp_path / "race" / "app.log"
+    cfg = LogConfig(stdout=None, file=FileConfig(path=str(log_path)), async_mode=True)
+    configure_logging(cfg)
+
+    errors: list[Exception] = []
+
+    def _worker() -> None:
+        for _ in range(25):
+            try:
+                microlog_logger._stop_listener()  # pyright: ignore[reportPrivateUsage]
+            except Exception as exc:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors

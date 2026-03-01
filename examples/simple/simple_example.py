@@ -1,61 +1,32 @@
-"""Simple microlog example with CLI-configurable settings via chz."""
+"""Simple microlog example that logs to stdout and a rotating file."""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 
-import chz
-
 from microlog import (
-    FileConfig,
-    LogConfig,
-    StdoutConfig,
     configure_logging,
     get_logger,
+    get_runtime_stats,
     log_context,
+    production_config,
 )
 
 
-@chz.chz
-class SimpleAppConfig:
-    service_name: str = "orders"
-    service_version: str | None = "1.0.0"
-    environment: str | None = "prod"
-    log_level: str = "INFO"
-    stdout_level: str = "INFO"
-    dev_color: bool = True
-    async_mode: bool = False
-    enable_file: bool = True
-    file_path: str = "./examples/logs/orders.log"
-    rotate_bytes: int | None = 10_000_000
-    rotate_backups: int = 7
-    file_level: str = "DEBUG"
-
-
-def run_example(settings: SimpleAppConfig) -> None:
-    file_cfg = (
-        FileConfig(
-            path=settings.file_path,
-            rotate_bytes=settings.rotate_bytes,
-            rotate_backups=settings.rotate_backups,
-            level=settings.file_level,
-        )
-        if settings.enable_file
-        else None
+def main() -> None:
+    cfg = production_config(
+        "orders",
+        service_version="1.0.0",
+        environment="prod",
+        level="INFO",
+        file_path="./examples/logs/orders.log",
+        file_level="DEBUG",
     )
-    if file_cfg is not None:
-        Path(file_cfg.path).parent.mkdir(parents=True, exist_ok=True)
-    cfg = LogConfig(
-        service_name=settings.service_name,
-        service_version=settings.service_version,
-        environment=settings.environment,
-        level=settings.log_level,
-        stdout=StdoutConfig(level=settings.stdout_level),
-        file=file_cfg,
-        dev_color=settings.dev_color,
-        async_mode=settings.async_mode,
-    )
+
+    if cfg.file:
+        Path(cfg.file.path).parent.mkdir(parents=True, exist_ok=True)
+
     configure_logging(cfg)
     log = get_logger(__name__, cfg)
 
@@ -66,13 +37,18 @@ def run_example(settings: SimpleAppConfig) -> None:
         except ZeroDivisionError:
             log.exception("error during checkout")
 
-    log.info("General logging here %s", 1 + 1)
+    log.info("general logging here", extra={"result": 1 + 1})
+    stats = get_runtime_stats()
+    log.info(
+        "logger stats",
+        extra={
+            "queued_records": stats.queued_records,
+            "dropped_records": stats.dropped_records,
+            "dropped_oldest_records": stats.dropped_oldest_records,
+        },
+    )
     logging.shutdown()
 
 
-def main(settings: SimpleAppConfig) -> None:
-    run_example(settings)
-
-
 if __name__ == "__main__":
-    chz.entrypoint(main)
+    main()

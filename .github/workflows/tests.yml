@@ -20,3 +20,10 @@ jobs:
           pip install . pytest
       - name: Run pytest
         run: pytest
+      - name: Benchmark guard
+        run: |
+          python benchmarks/benchmark.py \
+            --count 20000 \
+            --min-sync-rps 2500 \
+            --min-async-rps 2500 \
+            --max-drop-rate 0.05
