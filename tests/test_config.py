@@ -16,6 +16,11 @@ def test_default_stdout_enabled():
     assert cfg.utc is True
 
 
+def test_otlp_config_defaults_to_auto_security():
+    cfg = OTLPConfig()
+    assert cfg.insecure is None
+
+
 def test_disable_stdout():
     cfg = LogConfig(stdout=None)
     assert cfg.stdout is None
@@ -76,21 +81,23 @@ def test_production_config_otlp_and_file():
     cfg = production_config(
         "orders",
         file_path="/tmp/orders.log",
-        file_level="DEBUG",
         enable_otlp=True,
         otlp_endpoint="http://collector:4318/v1/logs",
-        otlp_headers={"x-api-key": "abc"},
-        otlp_timeout=3.5,
     )
     assert cfg.file is not None
     assert cfg.file.path == "/tmp/orders.log"
-    assert cfg.file.level == "DEBUG"
+    assert cfg.file.level is None
     assert isinstance(cfg.otlp, OTLPConfig)
     assert cfg.otlp.endpoint == "http://collector:4318/v1/logs"
-    assert cfg.otlp.headers["x-api-key"] == "abc"
-    assert cfg.otlp.timeout == 3.5
+    assert cfg.otlp.insecure is None
+    assert cfg.otlp.headers == {}
+    assert cfg.otlp.timeout is None
 
 
-def test_production_config_requires_sink():
-    with pytest.raises(ValueError):
-        production_config("orders", enable_stdout=False)
+def test_production_config_stays_opinionated():
+    cfg = production_config("orders", file_path="/tmp/orders.log", enable_otlp=True)
+    assert cfg.stdout is not None
+    assert cfg.file is not None
+    assert cfg.file.rotate_backups == 5
+    assert cfg.otlp is not None
+    assert cfg.otlp.protocol == "http/protobuf"

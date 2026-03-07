@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+import logging
+from typing import Any, Mapping
 
+MICROLOG_FIELDS = "_microlog"
 DEFAULT_REDACT_KEYS = frozenset(
     {
         "password",
@@ -15,22 +17,44 @@ DEFAULT_REDACT_KEYS = frozenset(
         "auth",
     }
 )
+RESERVED_FIELDS = frozenset(
+    {
+        "time",
+        "severity_text",
+        "severity_number",
+        "body",
+        "service.name",
+        "service.version",
+        "deployment.environment",
+        "logger.name",
+        "thread.name",
+        "host.name",
+        "process.pid",
+        "code.file.path",
+        "code.function.name",
+        "code.line.number",
+        "trace_id",
+        "span_id",
+        "trace_sampled",
+        "exception.type",
+        "exception.message",
+        "exception.stacktrace",
+        "stack",
+        MICROLOG_FIELDS,
+    }
+)
 
 
 def _redact_keys() -> set[str]:
     return set(DEFAULT_REDACT_KEYS)
 
 
-def _str_list() -> list[str]:
-    return []
-
-
-def _str_map() -> dict[str, str]:
-    return {}
-
-
-def _any_map() -> dict[str, Any]:
-    return {}
+def safe_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    if not fields:
+        return {}
+    if not RESERVED_FIELDS.intersection(fields):
+        return dict(fields)
+    return {key: value for key, value in fields.items() if key not in RESERVED_FIELDS}
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,16 +74,16 @@ class FileConfig:
 class OTLPConfig:
     protocol: str = "http/protobuf"
     endpoint: str | None = None
-    insecure: bool = True
-    headers: dict[str, str] = field(default_factory=_str_map)
+    insecure: bool | None = None
+    headers: dict[str, str] = field(default_factory=dict)
     compression: str | None = None
     timeout: float | None = None
     level: str | int | None = None
-    resource_attributes: dict[str, Any] = field(default_factory=_any_map)
+    resource_attributes: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "headers", dict(self.headers))
-        object.__setattr__(self, "resource_attributes", dict(self.resource_attributes))
+        for name in ("headers", "resource_attributes"):
+            object.__setattr__(self, name, dict(getattr(self, name)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,14 +111,42 @@ class LogConfig:
     include_host: bool = True
     include_code: bool = True
     try_opentelemetry: bool = True
-    static: dict[str, Any] = field(default_factory=_any_map)
+    static: dict[str, Any] = field(default_factory=dict)
     redact_keys: set[str] = field(default_factory=_redact_keys)
-    redact_value_patterns: list[str] = field(default_factory=_str_list)
+    redact_value_patterns: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "static", dict(self.static))
-        object.__setattr__(self, "redact_keys", set(self.redact_keys))
-        object.__setattr__(self, "redact_value_patterns", list(self.redact_value_patterns))
+        for name, copy in (
+            ("static", dict),
+            ("redact_keys", set),
+            ("redact_value_patterns", list),
+        ):
+            object.__setattr__(self, name, copy(getattr(self, name)))
+
+
+def service_fields(cfg: LogConfig, *, include_static: bool = False) -> dict[str, Any]:
+    fields: dict[str, Any] = {"service.name": cfg.service_name}
+    if cfg.service_version:
+        fields["service.version"] = cfg.service_version
+    if cfg.environment:
+        fields["deployment.environment"] = cfg.environment
+    if include_static and cfg.static:
+        fields.update(safe_fields(cfg.static))
+    return fields
+
+
+def resolve_level(level: str | int | None) -> int | None:
+    if level is None:
+        return None
+    if isinstance(level, int):
+        return level
+    try:
+        return int(level)
+    except (TypeError, ValueError):
+        pass
+    if isinstance(resolved := getattr(logging, str(level).upper(), None), int):
+        return resolved
+    raise ValueError(f"Unknown log level: {level}")
 
 
 def severity_number(levelno: int) -> int:

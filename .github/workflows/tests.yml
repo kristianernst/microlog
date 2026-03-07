@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  pytest:
+  core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,13 +17,30 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install . pytest
+          pip install . pytest ruff pyright
+      - name: Run Ruff
+        run: ruff check
+      - name: Run Pyright
+        run: pyright
       - name: Run pytest
         run: pytest
       - name: Benchmark guard
         run: |
-          python benchmarks/benchmark.py \
+          python -m benchmarks.benchmark \
             --count 20000 \
             --min-sync-rps 2500 \
             --min-async-rps 2500 \
             --max-drop-rate 0.05
+  otlp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies with OTLP extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[opentelemetry]" pytest
+      - name: Run pytest with OTLP extras
+        run: pytest

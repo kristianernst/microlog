@@ -5,14 +5,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, MutableMapping
 
-from .config import LogConfig
+from .config import MICROLOG_FIELDS, LogConfig, safe_fields
 
 _CTX: ContextVar[dict[str, Any]] = ContextVar("microlog_ctx", default={})
 
 
 @contextmanager
 def log_context(**attrs: Any):
-    token = _CTX.set({**_CTX.get(), **attrs})
+    token = _CTX.set({**_CTX.get(), **safe_fields(attrs)})
     try:
         yield
     finally:
@@ -20,15 +20,30 @@ def log_context(**attrs: Any):
 
 
 class ContextAdapter(logging.LoggerAdapter[logging.Logger]):
+    def __init__(
+        self,
+        logger: logging.Logger,
+        extra: dict[str, Any] | None,
+        fields: dict[str, Any] | None = None,
+    ):
+        base_fields = dict(extra or {})
+        if fields is not None:
+            base_fields.update(safe_fields(fields))
+        super().__init__(logger, base_fields)
+        self._fields = dict(base_fields)
+
     def process(self, msg: str, kwargs: MutableMapping[str, Any]):
-        kwargs["extra"] = {**(self.extra or {}), **(kwargs.get("extra") or {}), **_CTX.get()}
+        fields = dict(self._fields)
+        if extra := kwargs.get("extra"):
+            fields.update(safe_fields(extra))
+        if ctx := _CTX.get():
+            fields.update(ctx)
+        if fields:
+            kwargs["extra"] = {MICROLOG_FIELDS: fields}
+        else:
+            kwargs.pop("extra", None)
         return msg, kwargs
 
 
 def get_logger(name: str | None, cfg: LogConfig) -> ContextAdapter:
-    base = {"service.name": cfg.service_name, **cfg.static}
-    if cfg.service_version:
-        base["service.version"] = cfg.service_version
-    if cfg.environment:
-        base["deployment.environment"] = cfg.environment
-    return ContextAdapter(logging.getLogger(name or cfg.service_name), base)
+    return ContextAdapter(logging.getLogger(name or cfg.service_name), None)

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 
-from microlog import LogConfig, OTLPConfig, StdoutConfig, configure_logging, get_logger, log_context
+from microlog import (
+    LogConfig,
+    OTLPConfig,
+    StdoutConfig,
+    configure_logging,
+    get_logger,
+    log_context,
+    shutdown_logging,
+)
 
 
 def main() -> None:
@@ -33,12 +40,10 @@ def main() -> None:
                 log.exception("handled runtime error")
             log.info("completed work cycle", extra={"phase": "finish"})
 
-        log.info("Miley Cyrus!")
-
         time.sleep(2)
     finally:
-        # Ensure the OTLP logger provider/queue flush pending records before exit.
-        logging.shutdown()
+        # Drain the async queue and flush the OTLP logger provider before exit.
+        shutdown_logging()
 
 
 if __name__ == "__main__":

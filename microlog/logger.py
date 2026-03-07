@@ -15,10 +15,19 @@ from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Lock
-from types import MethodType
-from typing import Any, Callable, Iterable, cast
+from typing import Any, Iterable, cast
 
-from .config import FileConfig, LogConfig, OTLPConfig, StdoutConfig, severity_number
+from . import otel as _otel
+from .config import (
+    FileConfig,
+    LogConfig,
+    StdoutConfig,
+    MICROLOG_FIELDS,
+    resolve_level,
+    safe_fields,
+    service_fields,
+    severity_number,
+)
 
 try:
     import orjson as _ORJSON
@@ -30,27 +39,12 @@ _SKIP_EXTRA_KEYS = frozenset(logging.makeLogRecord({}).__dict__) | {
     "otelTraceID",
     "otelServiceName",
     "otelTraceSampled",
-}
-
-_OTEL_ATTR_MAP = {
-    "otelSpanID": ("span_id", 16),
-    "otelTraceID": ("trace_id", 32),
-    "otelServiceName": ("service.name", None),
-}
-
-_PROTOCOL_ALIASES = {
-    "http": "http/protobuf",
-    "http/protobuf": "http/protobuf",
-    "http_protobuf": "http/protobuf",
-    "http-protobuf": "http/protobuf",
-    "grpc": "grpc",
-    "grpc/protobuf": "grpc",
-    "grpc_proto": "grpc",
-    "grpc-protobuf": "grpc",
+    MICROLOG_FIELDS,
 }
 
 _listener: QueueListener | None = None
 _active_queue: Queue[logging.LogRecord] | None = None
+_listener_lock = Lock()
 _stats_lock = Lock()
 _stats: dict[str, int] = {
     "queued_records": 0,
@@ -58,10 +52,6 @@ _stats: dict[str, int] = {
     "dropped_oldest_records": 0,
     "shed_records": 0,
 }
-_metrics_lock = Lock()
-_runtime_metrics_enabled = False
-_runtime_metrics_attrs: dict[str, str] = {}
-_runtime_metrics_handles: list[Any] = []
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,112 +92,14 @@ def get_runtime_stats() -> RuntimeStats:
 
 def reset_runtime_stats() -> None:
     with _stats_lock:
-        _stats["queued_records"] = 0
-        _stats["dropped_records"] = 0
-        _stats["dropped_oldest_records"] = 0
-        _stats["shed_records"] = 0
-
-
-def enable_otel_runtime_metrics(
-    *,
-    meter: Any | None = None,
-    meter_name: str = "microlog",
-    attributes: dict[str, str] | None = None,
-) -> bool:
-    global _runtime_metrics_enabled, _runtime_metrics_attrs
-    try:
-        if meter is None:
-            from opentelemetry import metrics as otel_metrics  # type: ignore[import-not-found]
-
-            meter = otel_metrics.get_meter(meter_name)
-        from opentelemetry.metrics import Observation  # type: ignore[import-not-found]
-    except Exception:
-        return False
-    if meter is None:
-        return False
-
-    attrs = dict(attributes or {})
-    meter_obj = cast(Any, meter)
-
-    def _counter_callback(field: str):
-        def _callback(_options: Any):
-            if not _runtime_metrics_enabled:
-                return []
-            stats = get_runtime_stats()
-            return [Observation(getattr(stats, field), _runtime_metrics_attrs)]
-
-        return _callback
-
-    def _gauge_callback(field: str):
-        def _callback(_options: Any):
-            if not _runtime_metrics_enabled:
-                return []
-            stats = get_runtime_stats()
-            return [Observation(getattr(stats, field), _runtime_metrics_attrs)]
-
-        return _callback
-
-    with _metrics_lock:
-        if not _runtime_metrics_handles:
-            _runtime_metrics_handles.extend(
-                [
-                    meter_obj.create_observable_counter(
-                        "microlog_queued_records_total",
-                        callbacks=[_counter_callback("queued_records")],
-                        description="Total records accepted into microlog async queue.",
-                    ),
-                    meter_obj.create_observable_counter(
-                        "microlog_dropped_records_total",
-                        callbacks=[_counter_callback("dropped_records")],
-                        description="Total records dropped by microlog queue policies.",
-                    ),
-                    meter_obj.create_observable_counter(
-                        "microlog_shed_records_total",
-                        callbacks=[_counter_callback("shed_records")],
-                        description="Total records dropped by adaptive shedding policy.",
-                    ),
-                    meter_obj.create_observable_gauge(
-                        "microlog_queue_size",
-                        callbacks=[_gauge_callback("queue_size")],
-                        description="Current microlog async queue depth.",
-                    ),
-                    meter_obj.create_observable_gauge(
-                        "microlog_queue_maxsize",
-                        callbacks=[_gauge_callback("queue_maxsize")],
-                        description="Configured microlog async queue capacity.",
-                    ),
-                ]
-            )
-        _runtime_metrics_attrs = attrs
-        _runtime_metrics_enabled = True
-    return True
-
-
-def disable_otel_runtime_metrics() -> None:
-    global _runtime_metrics_enabled
-    with _metrics_lock:
-        _runtime_metrics_enabled = False
+        for name in _stats:
+            _stats[name] = 0
 
 
 def _isoformat(ts: float, use_utc: bool) -> str:
     dt = datetime.fromtimestamp(ts, timezone.utc if use_utc else None)
     text = dt.isoformat()
     return text.replace("+00:00", "Z") if use_utc and text.endswith("+00:00") else text
-
-
-def _resolve_level(level: str | int | None) -> int | None:
-    if level is None:
-        return None
-    if isinstance(level, int):
-        return level
-    try:
-        return int(level)
-    except (TypeError, ValueError):
-        pass
-    resolved = getattr(logging, str(level).upper(), None)
-    if isinstance(resolved, int):
-        return resolved
-    raise ValueError(f"Unknown log level: {level}")
 
 
 def _compile_patterns(patterns: Iterable[str]) -> tuple[re.Pattern[str], ...]:
@@ -255,103 +147,107 @@ def _json_dumps(payload: dict[str, Any], indent: int | None) -> str:
     )
 
 
-def _extract_otel_context(record: logging.LogRecord, try_opentelemetry: bool) -> dict[str, Any]:
-    ctx: dict[str, Any] = {}
+def _record_fields(record: logging.LogRecord, cfg: LogConfig) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "time": _isoformat(record.created, cfg.utc),
+        "severity_text": record.levelname,
+        "severity_number": severity_number(record.levelno),
+        "body": record.getMessage(),
+    }
+    if cfg.include_logger_name:
+        fields["logger.name"] = record.name
+    if cfg.include_thread:
+        fields["thread.name"] = record.threadName
+    if cfg.include_code:
+        fields.update(
+            {
+                "code.file.path": record.pathname,
+                "code.function.name": record.funcName,
+                "code.line.number": record.lineno,
+            }
+        )
+    return fields
 
-    for attr, (target, width) in _OTEL_ATTR_MAP.items():
-        value = getattr(record, attr, None)
-        if value is not None:
-            ctx[target] = f"{value:0{width}x}" if width and isinstance(value, int) else str(value)
 
-    sampled = getattr(record, "otelTraceSampled", None)
-    if sampled is not None:
-        ctx["trace_sampled"] = bool(sampled)
+def _record_payload(record: logging.LogRecord) -> dict[str, Any]:
+    if isinstance(payload := getattr(record, MICROLOG_FIELDS, None), dict):
+        return safe_fields(payload)
+    return safe_fields(
+        {key: value for key, value in record.__dict__.items() if key not in _SKIP_EXTRA_KEYS}
+    )
 
-    if try_opentelemetry and not (ctx.get("trace_id") and ctx.get("span_id")):
+
+def _error_fields(record: logging.LogRecord) -> dict[str, Any]:
+    if record.exc_info:
+        etype, evalue, etb = record.exc_info
+        return {
+            "exception.type": getattr(etype, "__name__", str(etype)),
+            "exception.message": str(evalue),
+            "exception.stacktrace": "".join(traceback.format_exception(etype, evalue, etb)).strip(),
+        }
+    return {"stack": str(record.stack_info)} if record.stack_info else {}
+
+
+def _close_handlers(handlers: Iterable[logging.Handler]) -> None:
+    for handler in handlers:
         try:
-            from opentelemetry.trace import get_current_span  # type: ignore[import-not-found]
-
-            span = cast(Any, get_current_span())
-            sc = span.get_span_context() if hasattr(span, "get_span_context") else None
-            if sc and getattr(sc, "is_valid", False):
-                if (trace_id := getattr(sc, "trace_id", None)) and "trace_id" not in ctx:
-                    ctx["trace_id"] = (
-                        f"{trace_id:032x}" if isinstance(trace_id, int) else str(trace_id)
-                    )
-                if (span_id := getattr(sc, "span_id", None)) and "span_id" not in ctx:
-                    ctx["span_id"] = f"{span_id:016x}" if isinstance(span_id, int) else str(span_id)
-                try:
-                    ctx.setdefault("trace_sampled", bool(int(getattr(sc, "trace_flags", 0)) & 1))
-                except Exception:
-                    pass
+            handler.close()
         except Exception:
             pass
 
-    return ctx
+
+def _stop_queue_listener(listener: QueueListener | None) -> None:
+    if listener is None:
+        return
+    try:
+        listener.stop()
+    except Exception:
+        pass
+    _close_handlers(cast(Iterable[logging.Handler], getattr(listener, "handlers", ())))
+
+
+def _clear_listener_state(listener: QueueListener | None) -> None:
+    global _listener, _active_queue
+    if listener is None:
+        return
+    with _listener_lock:
+        if _listener is listener:
+            _listener = None
+            _active_queue = None
+
+
+def _event_payload(
+    record: logging.LogRecord, cfg: LogConfig, base: dict[str, Any]
+) -> dict[str, Any]:
+    payload = dict(base)
+    for fields in (
+        _record_fields(record, cfg),
+        _otel._extract_otel_context(record, cfg.try_opentelemetry),
+        _record_payload(record),
+        _error_fields(record),
+    ):
+        payload.update(fields)
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 class JsonFormatter(logging.Formatter):
     def __init__(self, cfg: LogConfig):
         super().__init__()
         self._cfg = cfg
-        self._host = socket.gethostname() if cfg.include_host else None
-        self._pid = os.getpid() if cfg.include_pid else None
+        self._base = service_fields(cfg, include_static=True)
+        if cfg.include_host:
+            self._base["host.name"] = socket.gethostname()
+        if cfg.include_pid:
+            self._base["process.pid"] = os.getpid()
         self._keys = {key.lower() for key in cfg.redact_keys}
         self._patterns = _compile_patterns(cfg.redact_value_patterns)
+        self._should_scrub = bool(self._keys or self._patterns)
 
     def format(self, record: logging.LogRecord) -> str:
-        cfg = self._cfg
-        payload: dict[str, Any] = {
-            "time": _isoformat(record.created, cfg.utc),
-            "severity_text": record.levelname,
-            "severity_number": severity_number(record.levelno),
-            "body": record.getMessage(),
-            "service.name": cfg.service_name,
-        }
-
-        if cfg.include_logger_name:
-            payload["logger.name"] = record.name
-        if cfg.service_version:
-            payload["service.version"] = cfg.service_version
-        if cfg.environment:
-            payload["deployment.environment"] = cfg.environment
-        if self._host is not None:
-            payload["host.name"] = self._host
-        if self._pid is not None:
-            payload["process.pid"] = self._pid
-        if cfg.include_thread:
-            payload["thread.name"] = record.threadName
-        if cfg.include_code:
-            payload.update(
-                {
-                    "code.file.path": record.pathname,
-                    "code.function.name": record.funcName,
-                    "code.line.number": record.lineno,
-                }
-            )
-
-        payload.update(_extract_otel_context(record, cfg.try_opentelemetry))
-        payload.update(
-            {key: value for key, value in record.__dict__.items() if key not in _SKIP_EXTRA_KEYS}
-        )
-
-        if record.exc_info:
-            etype, evalue, etb = record.exc_info
-            payload["exception.type"] = getattr(etype, "__name__", str(etype))
-            payload["exception.message"] = str(evalue)
-            payload["exception.stacktrace"] = "".join(
-                traceback.format_exception(etype, evalue, etb)
-            ).strip()
-        elif record.stack_info:
-            payload["stack"] = str(record.stack_info)
-
-        if self._keys or self._patterns:
+        payload = _event_payload(record, self._cfg, self._base)
+        if self._should_scrub:
             payload = cast(dict[str, Any], _scrub(payload, self._keys, self._patterns))
-
-        return _json_dumps(
-            {key: value for key, value in payload.items() if value is not None},
-            cfg.json_indent,
-        )
+        return _json_dumps(payload, self._cfg.json_indent)
 
 
 class DevColorFormatter(logging.Formatter):
@@ -382,7 +278,7 @@ class DevColorFormatter(logging.Formatter):
             f"{_isoformat(record.created, cfg.utc)} "
             f"\x1b[{color}m{record.levelname}\x1b[0m {name} - {msg}{location}"
         )
-        ctx = _extract_otel_context(record, cfg.try_opentelemetry)
+        ctx = _otel._extract_otel_context(record, cfg.try_opentelemetry)
         if trace_id := ctx.get("trace_id"):
             line += f" (trace_id={trace_id} span_id={ctx.get('span_id')})"
         return line
@@ -409,6 +305,23 @@ class _BoundedQueueHandler(QueueHandler):
             else max(1, int(round(1.0 / self._shed_rate)))
         )
         self._shed_counter = 0
+        self._listener: QueueListener | None = None
+        self._listener_ref_lock = Lock()
+
+    def attach_listener(self, listener: QueueListener) -> None:
+        with self._listener_ref_lock:
+            self._listener = listener
+
+    def _take_listener(self) -> QueueListener | None:
+        with self._listener_ref_lock:
+            listener = self._listener
+            self._listener = None
+        return listener
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        # The queue is process-local, so preserve exception and stack metadata for
+        # the listener thread instead of letting QueueHandler flatten it into msg.
+        return logging.makeLogRecord(record.__dict__.copy())
 
     def _should_shed(self, queue: Queue[logging.LogRecord], record: logging.LogRecord) -> bool:
         if self._shed_below_level is None or self._shed_rate >= 1.0:
@@ -451,18 +364,25 @@ class _BoundedQueueHandler(QueueHandler):
         except (Empty, Full):
             _inc_stat("dropped_records")
 
+    def close(self) -> None:
+        listener = self._take_listener()
+        _clear_listener_state(listener)
+        _stop_queue_listener(listener)
+        super().close()
+
 
 def _stop_listener() -> None:
     global _listener, _active_queue
-    if _listener is None:
+    with _listener_lock:
+        listener = _listener
+        _listener = None
         _active_queue = None
-        return
-    try:
-        _listener.stop()
-    except Exception:
-        pass
-    _listener = None
-    _active_queue = None
+    _stop_queue_listener(listener)
+
+
+def shutdown_logging() -> None:
+    _stop_listener()
+    logging.shutdown()
 
 
 atexit.register(_stop_listener)
@@ -480,7 +400,7 @@ def _apply_format(handler: logging.Handler, cfg: LogConfig) -> None:
 
 def _stdout_handler(cfg: LogConfig, stdout_cfg: StdoutConfig) -> logging.Handler:
     handler = logging.StreamHandler(sys.stdout)
-    if (level := _resolve_level(stdout_cfg.level)) is not None:
+    if (level := resolve_level(stdout_cfg.level)) is not None:
         handler.setLevel(level)
     _apply_format(handler, cfg)
     return handler
@@ -499,182 +419,99 @@ def _file_handler(cfg: LogConfig, file_cfg: FileConfig) -> logging.Handler:
         backupCount=file_cfg.rotate_backups,
         encoding="utf-8",
     )
-    if (level := _resolve_level(file_cfg.level)) is not None:
+    if (level := resolve_level(file_cfg.level)) is not None:
         handler.setLevel(level)
     _apply_format(handler, cfg)
     return handler
 
 
-def _normalize_protocol(protocol: str) -> str:
-    if value := _PROTOCOL_ALIASES.get((protocol or "").strip().lower()):
-        return value
-    raise ValueError(f"Unsupported OTLP protocol '{protocol}'. Expected 'http/protobuf' or 'grpc'.")
-
-
-def _resolve_otlp_endpoint(protocol: str, otlp_cfg: OTLPConfig) -> str:
-    return (
-        otlp_cfg.endpoint
-        or os.getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
-        or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-        or ("http://localhost:4318/v1/logs" if protocol == "http/protobuf" else "localhost:4317")
-    )
-
-
-def _build_otlp_exporter(
-    protocol: str, otlp_cfg: OTLPConfig
-) -> tuple[Any, Callable[[], None] | None]:
-    endpoint = _resolve_otlp_endpoint(protocol, otlp_cfg)
-    headers = dict(otlp_cfg.headers) if otlp_cfg.headers else None
-    timeout = float(otlp_cfg.timeout) if otlp_cfg.timeout is not None else None
-
-    if protocol == "http/protobuf":
-        try:
-            from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-        except Exception as exc:  # pragma: no cover - optional dependency handling
-            raise RuntimeError(
-                "OTLP HTTP exporter requested, but opentelemetry-exporter-otlp-proto-http is not installed."
-            ) from exc
-
-        kwargs: dict[str, Any] = {"endpoint": endpoint}
-        if headers:
-            kwargs["headers"] = headers
-        if otlp_cfg.compression:
-            kwargs["compression"] = otlp_cfg.compression
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-
-        cleanup: Callable[[], None] | None = None
-        if otlp_cfg.insecure:
-            try:
-                import requests
-            except Exception as exc:  # pragma: no cover - optional dependency handling
-                raise RuntimeError(
-                    "HTTP OTLP exporting requested with insecure=True, but the requests package is unavailable."
-                ) from exc
-            session = requests.Session()
-            session.verify = False
-            kwargs["session"] = session
-            cleanup = session.close
-
-        return OTLPLogExporter(**kwargs), cleanup
-
-    try:
-        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
-    except Exception as exc:  # pragma: no cover - optional dependency handling
-        raise RuntimeError(
-            "OTLP gRPC exporter requested, but opentelemetry-exporter-otlp-proto-grpc is not installed."
-        ) from exc
-
-    kwargs: dict[str, Any] = {"endpoint": endpoint, "insecure": otlp_cfg.insecure}
-    if headers:
-        kwargs["headers"] = headers
-    if otlp_cfg.compression:
-        kwargs["compression"] = otlp_cfg.compression
-    if timeout is not None:
-        kwargs["timeout"] = timeout
-    return OTLPLogExporter(**kwargs), None
-
-
-def _otlp_resource_attributes(cfg: LogConfig, otlp_cfg: OTLPConfig) -> dict[str, Any]:
-    attrs: dict[str, Any] = {"service.name": cfg.service_name}
-    if cfg.service_version:
-        attrs["service.version"] = cfg.service_version
-    if cfg.environment:
-        attrs["deployment.environment"] = cfg.environment
-    attrs.update(otlp_cfg.resource_attributes)
-    return attrs
-
-
-def _otlp_handler(cfg: LogConfig, otlp_cfg: OTLPConfig) -> logging.Handler:
-    exporter, cleanup = _build_otlp_exporter(_normalize_protocol(otlp_cfg.protocol), otlp_cfg)
-    try:
-        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-        from opentelemetry.sdk.resources import Resource
-    except Exception as exc:
-        raise RuntimeError(
-            "OTLP logging requested, but the opentelemetry-sdk package is not installed."
-        ) from exc
-
-    provider = LoggerProvider(resource=Resource.create(_otlp_resource_attributes(cfg, otlp_cfg)))
-    provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
-    handler = LoggingHandler(
-        level=_resolve_level(otlp_cfg.level) or logging.NOTSET, logger_provider=provider
-    )
-    original_close = handler.close
-
-    def _safe_close(self: logging.Handler) -> None:
-        for fn in (original_close, provider.shutdown, cleanup):
-            if fn is None:
-                continue
-            try:
-                fn()
-            except Exception:
-                pass
-
-    handler.close = MethodType(_safe_close, handler)
-    return handler
+def _replace_root_handlers(
+    root: logging.Logger, level: int, handlers: Iterable[logging.Handler]
+) -> None:
+    root.setLevel(level)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    for handler in handlers:
+        root.addHandler(handler)
 
 
 def _build_handlers(cfg: LogConfig) -> list[logging.Handler]:
-    handlers = [
-        handler
-        for handler in (
-            _stdout_handler(cfg, cfg.stdout) if cfg.stdout else None,
-            _file_handler(cfg, cfg.file) if cfg.file else None,
-        )
-        if handler is not None
-    ]
-    if cfg.otlp:
-        try:
-            handlers.append(_otlp_handler(cfg, cfg.otlp))
-        except Exception as exc:
-            if not cfg.otlp_fail_open:
-                raise
-            warnings.warn(
-                f"OTLP handler setup failed, continuing without OTLP sink: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    if not handlers:
-        raise ValueError("At least one of stdout, file, or otlp logging must be configured.")
-    return handlers
+    handlers: list[logging.Handler] = []
+    try:
+        if cfg.stdout:
+            handlers.append(_stdout_handler(cfg, cfg.stdout))
+        if cfg.file:
+            handlers.append(_file_handler(cfg, cfg.file))
+        if cfg.otlp:
+            try:
+                handlers.append(_otel._otlp_handler(cfg, cfg.otlp))
+            except Exception as exc:
+                if not cfg.otlp_fail_open:
+                    raise
+                warnings.warn(
+                    f"OTLP handler setup failed, continuing without OTLP sink: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if not handlers:
+            raise ValueError("At least one of stdout, file, or otlp logging must be configured.")
+        return handlers
+    except Exception:
+        _close_handlers(handlers)
+        raise
 
 
 def configure_logging(cfg: LogConfig) -> None:
     global _listener, _active_queue
 
     root = logging.getLogger()
-    root.setLevel(_resolve_level(cfg.level) or logging.INFO)
-    _active_queue = None
-
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-        try:
-            handler.close()
-        except Exception:
-            pass
-
-    _stop_listener()
+    resolved_root_level = resolve_level(cfg.level)
+    root_level = logging.INFO if resolved_root_level is None else resolved_root_level
+    shed_level = resolve_level(cfg.shed_below_level) if cfg.async_mode else None
     handlers = _build_handlers(cfg)
+    root_handlers: list[logging.Handler] = handlers
+    listener: QueueListener | None = None
+    queue: Queue[logging.LogRecord] | None = None
 
     if cfg.async_mode:
-        queue: Queue[logging.LogRecord] = Queue(max(0, cfg.async_queue_size))
-        root.addHandler(
-            _BoundedQueueHandler(
-                queue,
-                cfg.async_queue_drop_oldest,
-                shed_below_level=_resolve_level(cfg.shed_below_level),
-                shed_when_queue_above=cfg.shed_when_queue_above,
-                shed_rate=cfg.shed_rate,
-            )
+        queue = Queue(max(0, cfg.async_queue_size))
+        queue_handler = _BoundedQueueHandler(
+            queue,
+            cfg.async_queue_drop_oldest,
+            shed_below_level=shed_level,
+            shed_when_queue_above=cfg.shed_when_queue_above,
+            shed_rate=cfg.shed_rate,
         )
-        _active_queue = queue
-        _listener = QueueListener(queue, *handlers, respect_handler_level=True)
-        _listener.start()
-    else:
-        _active_queue = None
-        for handler in handlers:
-            root.addHandler(handler)
+        root_handlers = [queue_handler]
+        listener = QueueListener(queue, *handlers, respect_handler_level=True)
+        queue_handler.attach_listener(listener)
+        try:
+            listener.start()
+        except Exception:
+            _close_handlers(root_handlers)
+            _stop_queue_listener(listener)
+            _close_handlers(handlers)
+            raise
+
+    with _listener_lock:
+        old_level = root.level
+        old_handlers = list(root.handlers)
+        old_listener = _listener
+        old_queue = _active_queue
+        try:
+            _replace_root_handlers(root, root_level, root_handlers)
+            _listener = listener
+            _active_queue = queue
+        except Exception:
+            _replace_root_handlers(root, old_level, old_handlers)
+            _listener = old_listener
+            _active_queue = old_queue
+            _close_handlers(root_handlers)
+            _stop_queue_listener(listener)
+            _close_handlers(handlers)
+            raise
+
+    _stop_queue_listener(old_listener)
+    _close_handlers(old_handlers)
 
     logging.captureWarnings(True)

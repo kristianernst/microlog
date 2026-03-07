@@ -1,7 +1,7 @@
 """Top‑level package for microlog.
 
 Exposes `LogConfig`, `StdoutConfig`, `FileConfig`, `OTLPConfig`, `configure_logging`,
-`get_logger`, `log_context`, `production_config`, and runtime stats helpers.
+`shutdown_logging`, `get_logger`, `log_context`, `production_config`, and runtime stats helpers.
 See module docstrings for usage examples.
 """
 
@@ -9,11 +9,11 @@ from .config import FileConfig, LogConfig, OTLPConfig, StdoutConfig
 from .logger import (
     RuntimeStats,
     configure_logging,
-    disable_otel_runtime_metrics,
-    enable_otel_runtime_metrics,
     get_runtime_stats,
     reset_runtime_stats,
+    shutdown_logging,
 )
+from .otel import disable_otel_runtime_metrics, enable_otel_runtime_metrics
 from .adapter import get_logger, log_context
 from .presets import production_config
 
@@ -28,6 +28,7 @@ __all__ = [
     "disable_otel_runtime_metrics",
     "get_runtime_stats",
     "reset_runtime_stats",
+    "shutdown_logging",
     "get_logger",
     "log_context",
     "production_config",

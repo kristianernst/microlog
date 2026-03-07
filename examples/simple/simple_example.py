@@ -1,8 +1,7 @@
-"""Simple microlog example that logs to stdout and a rotating file."""
+"""Simple microlog example that logs to stdout and a file."""
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 from microlog import (
@@ -11,6 +10,7 @@ from microlog import (
     get_runtime_stats,
     log_context,
     production_config,
+    shutdown_logging,
 )
 
 
@@ -21,7 +21,6 @@ def main() -> None:
         environment="prod",
         level="INFO",
         file_path="./examples/logs/orders.log",
-        file_level="DEBUG",
     )
 
     if cfg.file:
@@ -47,7 +46,7 @@ def main() -> None:
             "dropped_oldest_records": stats.dropped_oldest_records,
         },
     )
-    logging.shutdown()
+    shutdown_logging()
 
 
 if __name__ == "__main__":
