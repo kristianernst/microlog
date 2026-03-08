@@ -47,7 +47,7 @@ def _run(mode: str, count: int) -> BenchResult:
             stdout=StdoutConfig(level="INFO"),
             file=None,
             async_mode=(mode == "async"),
-            async_queue_size=0 if mode == "async" else 10_000,
+            async_queue_size=10_000,
             async_queue_drop_oldest=True,
             include_code=False,
             include_host=False,

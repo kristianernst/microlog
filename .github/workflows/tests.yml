@@ -18,6 +18,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install . pytest ruff pyright
+      - name: Verify installed artifact outside checkout
+        working-directory: /tmp
+        run: |
+          python -I - <<'PY'
+          import logging
+          import os
+          from pathlib import Path
+
+          import microlog
+
+          module_path = Path(microlog.__file__).resolve()
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          if module_path.is_relative_to(workspace):
+              raise SystemExit(f"microlog imported from checkout: {module_path}")
+
+          cfg = microlog.LogConfig(async_mode=False)
+          microlog.configure_logging(cfg)
+          microlog.get_logger("smoke", cfg).info("installed-artifact")
+          logging.shutdown()
+          print(module_path)
+          PY
       - name: Run Ruff
         run: ruff check
       - name: Run Pyright
