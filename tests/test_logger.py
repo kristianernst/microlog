@@ -556,7 +556,8 @@ def test_runtime_stats_track_unbounded_async_queue(tmp_path: Path) -> None:
         async_mode=True,
         async_queue_size=0,
     )
-    configure_logging(cfg)
+    with pytest.warns(RuntimeWarning, match="unbounded"):
+        configure_logging(cfg)
     logger = get_logger(None, cfg)
     logger.info("runtime")
     stats = get_runtime_stats()

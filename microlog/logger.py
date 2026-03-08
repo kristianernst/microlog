@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import atexit
+import errno
 import json
 import logging
 import os
-import re
 import socket
+import stat
 import sys
 import traceback
 import warnings
@@ -28,6 +29,7 @@ from .config import (
     service_fields,
     severity_number,
 )
+from .scrub import Redactor, escape_control_chars
 
 try:
     import orjson as _ORJSON
@@ -100,31 +102,6 @@ def _isoformat(ts: float, use_utc: bool) -> str:
     dt = datetime.fromtimestamp(ts, timezone.utc if use_utc else None)
     text = dt.isoformat()
     return text.replace("+00:00", "Z") if use_utc and text.endswith("+00:00") else text
-
-
-def _compile_patterns(patterns: Iterable[str]) -> tuple[re.Pattern[str], ...]:
-    compiled: list[re.Pattern[str]] = []
-    for pattern in patterns:
-        try:
-            compiled.append(re.compile(pattern))
-        except re.error:
-            continue
-    return tuple(compiled)
-
-
-def _scrub(value: Any, keys: set[str], patterns: tuple[re.Pattern[str], ...]) -> Any:
-    if isinstance(value, dict):
-        mapping = cast(dict[Any, Any], value)
-        return {
-            key: "***" if str(key).lower() in keys else _scrub(item, keys, patterns)
-            for key, item in mapping.items()
-        }
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_scrub(item, keys, patterns) for item in cast(Iterable[Any], value)]
-    if isinstance(value, str):
-        for pattern in patterns:
-            value = pattern.sub("***", value)
-    return value
 
 
 def _json_dumps(payload: dict[str, Any], indent: int | None) -> str:
@@ -239,14 +216,13 @@ class JsonFormatter(logging.Formatter):
             self._base["host.name"] = socket.gethostname()
         if cfg.include_pid:
             self._base["process.pid"] = os.getpid()
-        self._keys = {key.lower() for key in cfg.redact_keys}
-        self._patterns = _compile_patterns(cfg.redact_value_patterns)
-        self._should_scrub = bool(self._keys or self._patterns)
+        self._redactor = Redactor(cfg.redact_keys, cfg.redact_value_patterns)
+        self._should_scrub = bool(self._redactor.keys or self._redactor.patterns)
 
     def format(self, record: logging.LogRecord) -> str:
         payload = _event_payload(record, self._cfg, self._base)
         if self._should_scrub:
-            payload = cast(dict[str, Any], _scrub(payload, self._keys, self._patterns))
+            payload = cast(dict[str, Any], self._redactor.scrub(payload))
         return _json_dumps(payload, self._cfg.json_indent)
 
 
@@ -262,13 +238,13 @@ class DevColorFormatter(logging.Formatter):
     def __init__(self, cfg: LogConfig):
         super().__init__()
         self._cfg = cfg
-        self._patterns = _compile_patterns(cfg.redact_value_patterns)
+        self._redactor = Redactor(cfg.redact_keys, cfg.redact_value_patterns)
 
     def format(self, record: logging.LogRecord) -> str:
         cfg = self._cfg
         color = self._LEVEL_COLORS.get(record.levelno, 37)
         name = record.name if cfg.include_logger_name else cfg.service_name
-        msg = cast(str, _scrub(record.getMessage(), set(), self._patterns))
+        msg = escape_control_chars(self._redactor.scrub_text(record.getMessage()))
         location = (
             f" [{os.path.basename(record.pathname)}:{record.lineno} {record.funcName}()]"
             if cfg.include_code
@@ -406,14 +382,57 @@ def _stdout_handler(cfg: LogConfig, stdout_cfg: StdoutConfig) -> logging.Handler
     return handler
 
 
+def _reject_symlink_path(path: Path) -> None:
+    probe = Path(path.anchor) if path.anchor else Path()
+    for part in path.parts[1 if path.anchor else 0 :]:
+        probe /= part
+        try:
+            if probe.is_symlink():
+                raise RuntimeError(f"Refusing to open log file through symlinked path '{probe}'.")
+        except OSError as exc:
+            raise RuntimeError(f"Unable to inspect log path '{probe}': {exc}") from exc
+
+
+class _SecureRotatingFileHandler(RotatingFileHandler):
+    def _open(self):  # type: ignore[override]
+        if os.name != "posix":
+            return super()._open()
+
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.baseFilename, flags, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise RuntimeError(
+                    f"Refusing to open symlinked log file '{self.baseFilename}'."
+                ) from exc
+            raise RuntimeError(f"Unable to open log file '{self.baseFilename}': {exc}") from exc
+
+        try:
+            st_mode = os.fstat(fd).st_mode
+            if not stat.S_ISREG(st_mode):
+                raise RuntimeError(f"Refusing to log to non-regular file '{self.baseFilename}'.")
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+        except Exception:
+            os.close(fd)
+            raise
+
+
 def _file_handler(cfg: LogConfig, file_cfg: FileConfig) -> logging.Handler:
-    path = Path(file_cfg.path).expanduser()
+    path = Path(file_cfg.path).expanduser().absolute()
+    _reject_symlink_path(path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     except Exception as exc:
         raise RuntimeError(f"Unable to create log directory '{path.parent}': {exc}") from exc
 
-    handler = RotatingFileHandler(
+    handler = _SecureRotatingFileHandler(
         str(path),
         maxBytes=file_cfg.rotate_bytes or 0,
         backupCount=file_cfg.rotate_backups,
@@ -474,6 +493,12 @@ def configure_logging(cfg: LogConfig) -> None:
     queue: Queue[logging.LogRecord] | None = None
 
     if cfg.async_mode:
+        if cfg.async_queue_size <= 0:
+            warnings.warn(
+                "async_queue_size=0 creates an unbounded queue and can exhaust memory under sustained log floods.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         queue = Queue(max(0, cfg.async_queue_size))
         queue_handler = _BoundedQueueHandler(
             queue,

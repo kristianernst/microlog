@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from threading import Lock
 from types import MethodType
 from typing import Any, Callable, Mapping, cast
@@ -14,6 +15,7 @@ from .config import (
     safe_fields,
     service_fields,
 )
+from .scrub import Redactor
 
 _OTEL_ATTR_MAP = {
     "otelSpanID": ("span_id", 16),
@@ -72,9 +74,20 @@ _METRIC_SPECS = (
 
 
 class _OTLPRecordFilter(logging.Filter):
-    def __init__(self, static_fields: Mapping[str, Any] | None = None) -> None:
+    _STANDARD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
+
+    def __init__(
+        self,
+        static_fields: Mapping[str, Any] | None = None,
+        *,
+        redact_keys: set[str] | None = None,
+        redact_value_patterns: list[str] | None = None,
+    ) -> None:
         super().__init__()
-        self._static_fields = safe_fields(static_fields or {})
+        self._redactor = Redactor(redact_keys or (), redact_value_patterns or ())
+        self._static_fields = cast(
+            dict[str, Any], self._redactor.scrub(safe_fields(static_fields or {}))
+        )
 
     def filter(self, record: logging.LogRecord) -> bool:
         for key, value in self._static_fields.items():
@@ -84,6 +97,33 @@ class _OTLPRecordFilter(logging.Filter):
             record.__dict__.update(safe_fields(payload))
         for key in RESERVED_FIELDS:
             record.__dict__.pop(key, None)
+        message = record.msg if not record.args and not isinstance(record.msg, str) else record.getMessage()
+        record.msg = self._redactor.scrub(message)
+        record.args = ()
+        if record.exc_info:
+            etype, evalue, etb = record.exc_info
+            record.__dict__.update(
+                cast(
+                    dict[str, Any],
+                    self._redactor.scrub(
+                        {
+                            "exception.type": getattr(etype, "__name__", str(etype)),
+                            "exception.message": str(evalue),
+                            "exception.stacktrace": "".join(
+                                traceback.format_exception(etype, evalue, etb)
+                            ).strip(),
+                        }
+                    ),
+                )
+            )
+            record.exc_info = None
+        elif record.stack_info:
+            record.__dict__["stack"] = self._redactor.scrub_text(str(record.stack_info))
+        record.stack_info = None
+        for key, value in tuple(record.__dict__.items()):
+            if key in self._STANDARD_FIELDS:
+                continue
+            record.__dict__[key] = self._redactor.scrub(value)
         return True
 
 
@@ -202,7 +242,7 @@ def _resolve_otlp_insecure(protocol: str, endpoint: str, insecure: bool | None) 
         return insecure
     if protocol == "http/protobuf":
         return False
-    return not endpoint.strip().lower().startswith("https://")
+    return endpoint.strip().lower().startswith("http://")
 
 
 def _otlp_exporter_kwargs(
@@ -272,14 +312,26 @@ def _otlp_handler(cfg: LogConfig, otlp_cfg: OTLPConfig) -> logging.Handler:
             "OTLP logging requested, but the opentelemetry-sdk package is not installed."
         ) from exc
 
+    redactor = Redactor(cfg.redact_keys, cfg.redact_value_patterns)
     provider = LoggerProvider(
-        resource=Resource.create({**otlp_cfg.resource_attributes, **service_fields(cfg)})
+        resource=Resource.create(
+            cast(
+                dict[str, Any],
+                redactor.scrub({**otlp_cfg.resource_attributes, **service_fields(cfg)}),
+            )
+        )
     )
     provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
     handler = LoggingHandler(
         level=resolve_level(otlp_cfg.level) or logging.NOTSET, logger_provider=provider
     )
-    handler.addFilter(_OTLPRecordFilter(cfg.static))
+    handler.addFilter(
+        _OTLPRecordFilter(
+            cfg.static,
+            redact_keys=cfg.redact_keys,
+            redact_value_patterns=cfg.redact_value_patterns,
+        )
+    )
     original_close = handler.close
 
     def _safe_close(self: logging.Handler) -> None:
