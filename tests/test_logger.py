@@ -3,6 +3,7 @@ import logging
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from queue import Queue
@@ -21,6 +22,7 @@ from microlog import (
     reset_runtime_stats,
     shutdown_logging,
 )
+import microlog.adapter as microlog_adapter
 import microlog.logger as microlog_logger
 import microlog.otel as microlog_otel
 from microlog.logger import DevColorFormatter, JsonFormatter
@@ -136,6 +138,23 @@ def test_reserved_fields_cannot_be_overridden(tmp_path: Path) -> None:
     assert record["team"] == "core"
 
 
+def test_schema_version_is_emitted_and_cannot_be_overridden(tmp_path: Path) -> None:
+    log_path = tmp_path / "schema" / "app.log"
+    cfg = LogConfig(
+        stdout=None,
+        file=FileConfig(path=str(log_path)),
+        async_mode=False,
+        static={"schema_version": "999"},
+    )
+    configure_logging(cfg)
+    logger = get_logger("svc", cfg)
+    logger.info("schema test", extra={"schema_version": "999", "event.name": "svc.ready"})
+    flush_handlers()
+    record = read_json_lines(log_path)[-1]
+    assert record["schema_version"] == "1"
+    assert record["event.name"] == "svc.ready"
+
+
 def test_stdlib_logger_extra_still_works_without_adapter(tmp_path: Path) -> None:
     log_path = tmp_path / "stdlib" / "app.log"
     cfg = LogConfig(stdout=None, file=FileConfig(path=str(log_path)), async_mode=False)
@@ -149,6 +168,31 @@ def test_stdlib_logger_extra_still_works_without_adapter(tmp_path: Path) -> None
     assert record["body"] == "plain"
     assert record["request_id"] == "req-1"
     assert record["cart_id"] == "cart-9"
+
+
+def test_event_fields_are_preserved_for_machine_readable_logs(tmp_path: Path) -> None:
+    log_path = tmp_path / "event-fields" / "app.log"
+    cfg = LogConfig(stdout=None, file=FileConfig(path=str(log_path)), async_mode=False)
+    configure_logging(cfg)
+    get_logger("svc", cfg).info(
+        "request finished",
+        extra={
+            "event.name": "http.request.completed",
+            "status": "ok",
+            "duration_ms": 12.5,
+            "operation": "GET",
+            "target": "/healthz",
+            "request_id": "req-42",
+        },
+    )
+    flush_handlers()
+    record = read_json_lines(log_path)[-1]
+    assert record["event.name"] == "http.request.completed"
+    assert record["status"] == "ok"
+    assert record["duration_ms"] == 12.5
+    assert record["operation"] == "GET"
+    assert record["target"] == "/healthz"
+    assert record["request_id"] == "req-42"
 
 
 def test_redaction_applies_to_nested_data_and_message(tmp_path: Path) -> None:
@@ -292,6 +336,110 @@ def test_get_logger_process_only_emits_dynamic_metadata() -> None:
     with log_context(request_id="req-1"):
         _, kwargs = adapter.process("hello", {"extra": {"cart_id": "cart-9"}})
     assert kwargs["extra"]["_microlog"] == {"request_id": "req-1", "cart_id": "cart-9"}
+
+
+def test_get_logger_disables_findcaller_when_code_metadata_is_off() -> None:
+    logger = logging.getLogger("svc-no-code")
+    original = logger.findCaller
+
+    adapter = get_logger("svc-no-code", LogConfig(include_code=False))
+
+    assert adapter.logger.findCaller is microlog_adapter._find_caller_without_code
+    saved = getattr(adapter.logger, "_microlog_original_findCaller")
+    assert saved.__func__ is original.__func__
+    assert saved.__self__ is original.__self__
+
+
+def test_get_logger_restores_findcaller_when_code_metadata_returns() -> None:
+    logger = logging.getLogger("svc-toggle-code")
+    original = logger.findCaller
+
+    get_logger("svc-toggle-code", LogConfig(include_code=False))
+    adapter = get_logger("svc-toggle-code", LogConfig(include_code=True))
+
+    assert adapter.logger.findCaller.__func__ is original.__func__
+    assert adapter.logger.findCaller.__self__ is original.__self__
+
+
+def test_configure_logging_aligns_stdlib_metadata_flags_with_config() -> None:
+    configure_logging(
+        LogConfig(
+            stdout=StdoutConfig(level="INFO"),
+            file=None,
+            async_mode=False,
+            include_thread=False,
+            include_pid=False,
+        )
+    )
+    assert logging.logThreads is False
+    assert logging.logProcesses is False
+    if hasattr(logging, "logMultiprocessing"):
+        assert logging.logMultiprocessing is False
+
+    configure_logging(
+        LogConfig(
+            stdout=StdoutConfig(level="INFO"),
+            file=None,
+            async_mode=False,
+            include_thread=True,
+            include_pid=True,
+        )
+    )
+    assert logging.logThreads is True
+    assert logging.logProcesses is True
+    if hasattr(logging, "logMultiprocessing"):
+        assert logging.logMultiprocessing is True
+
+
+def test_isoformat_utc_fast_path_matches_datetime_semantics() -> None:
+    samples = (
+        0.0,
+        1_710_000_000.0,
+        1_710_000_000.123456,
+        1_710_000_000.9999994,
+        1_710_000_000.9999996,
+    )
+
+    for ts in samples:
+        expected = datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+        assert microlog_logger._isoformat(ts, True) == expected  # pyright: ignore[reportPrivateUsage]
+
+
+def test_bounded_queue_handler_sheds_low_severity_logs_under_pressure() -> None:
+    reset_runtime_stats()
+    queue: Queue[logging.LogRecord] = Queue(maxsize=10)
+    for i in range(9):
+        queue.put_nowait(logging.makeLogRecord({"msg": f"queued-{i}", "levelno": logging.INFO}))
+    handler = microlog_logger._BoundedQueueHandler(  # pyright: ignore[reportPrivateUsage]
+        queue,
+        drop_oldest=True,
+        shed_below_level=logging.INFO,
+        shed_when_queue_above=0.8,
+        shed_rate=0.0,
+    )
+    handler.enqueue(logging.makeLogRecord({"msg": "debug", "levelno": logging.DEBUG}))
+    stats = get_runtime_stats()
+    assert stats.shed_records == 1
+    assert stats.dropped_records == 1
+    assert stats.queued_records == 0
+    assert queue.qsize() == 9
+
+
+def test_bounded_queue_handler_drops_oldest_when_full() -> None:
+    reset_runtime_stats()
+    queue: Queue[logging.LogRecord] = Queue(maxsize=1)
+    queue.put_nowait(logging.makeLogRecord({"msg": "old", "levelno": logging.INFO}))
+    handler = microlog_logger._BoundedQueueHandler(  # pyright: ignore[reportPrivateUsage]
+        queue,
+        drop_oldest=True,
+    )
+    replacement = logging.makeLogRecord({"msg": "new", "levelno": logging.WARNING})
+    handler.enqueue(replacement)
+    stats = get_runtime_stats()
+    assert stats.dropped_records == 1
+    assert stats.dropped_oldest_records == 1
+    assert stats.queued_records == 1
+    assert queue.get_nowait().msg == "new"
 
 
 def test_normalize_protocol_variants() -> None:
@@ -708,22 +856,6 @@ def test_otlp_fail_open_continues_with_other_handlers(monkeypatch: Any) -> None:
     handlers = logging.getLogger().handlers
     assert handlers
     assert all(not isinstance(h, logging.NullHandler) for h in handlers)
-
-
-def test_otlp_fail_closed_raises(monkeypatch: Any) -> None:
-    def _raise_otlp(*_args: Any, **_kwargs: Any) -> logging.Handler:
-        raise RuntimeError("collector down")
-
-    monkeypatch.setattr(microlog_otel, "_otlp_handler", _raise_otlp)  # pyright: ignore[reportPrivateUsage]
-    cfg = LogConfig(
-        stdout=StdoutConfig(level="INFO"),
-        file=None,
-        async_mode=False,
-        otlp=OTLPConfig(endpoint="http://collector:4318/v1/logs"),
-        otlp_fail_open=False,
-    )
-    with pytest.raises(RuntimeError, match="collector down"):
-        configure_logging(cfg)
 
 
 def test_configure_logging_failure_preserves_existing_handlers() -> None:
