@@ -44,8 +44,7 @@ _listener: QueueListener | None = None
 _active_queue: Queue[logging.LogRecord] | None = None
 _listener_lock = Lock()
 _stats_lock = Lock()
-_iso_utc_cache_second: int | None = None
-_iso_utc_cache_prefix = ""
+_iso_utc_cache: tuple[int | None, str] = (None, "")
 _stats: dict[str, int] = {
     "queued_records": 0,
     "dropped_records": 0,
@@ -100,20 +99,20 @@ def _isoformat(ts: float, use_utc: bool) -> str:
     if not use_utc:
         return datetime.fromtimestamp(ts).isoformat()
 
-    global _iso_utc_cache_second, _iso_utc_cache_prefix
+    global _iso_utc_cache
     second = int(ts)
     micros = int(round((ts - second) * 1_000_000))
     if micros >= 1_000_000:
         second += 1
         micros = 0
-    if _iso_utc_cache_second != second:
-        _iso_utc_cache_second = second
-        _iso_utc_cache_prefix = datetime.fromtimestamp(second, timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
+
+    cache_second, cache_prefix = _iso_utc_cache
+    if cache_second != second:
+        cache_prefix = datetime.fromtimestamp(second, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        _iso_utc_cache = (second, cache_prefix)
     if micros:
-        return f"{_iso_utc_cache_prefix}.{micros:06d}Z"
-    return f"{_iso_utc_cache_prefix}Z"
+        return f"{cache_prefix}.{micros:06d}Z"
+    return f"{cache_prefix}Z"
 
 
 def _close_handlers(handlers: Iterable[logging.Handler]) -> None:

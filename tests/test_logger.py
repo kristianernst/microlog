@@ -239,6 +239,17 @@ def test_redaction_applies_to_nested_data_and_message(tmp_path: Path) -> None:
     assert record["custom"] == "custom-value"
 
 
+def test_redaction_keeps_bearer_scrubbing_case_insensitive(tmp_path: Path) -> None:
+    log_path = tmp_path / "bearer-scrub" / "app.log"
+    cfg = LogConfig(stdout=None, file=FileConfig(path=str(log_path)), async_mode=False)
+    configure_logging(cfg)
+    logger = get_logger("svc", cfg)
+    logger.info("Authorization: BEARER abc123")
+    flush_handlers()
+    record = read_json_lines(log_path)[-1]
+    assert record["body"] == "Authorization: BEARER ***"
+
+
 def test_stdout_logging_includes_context(capfd) -> None:
     cfg = LogConfig(stdout=StdoutConfig(level="INFO"), file=None, async_mode=False)
     configure_logging(cfg)

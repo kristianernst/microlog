@@ -97,7 +97,7 @@ class Redactor:
                 ),
                 value,
             )
-        if self._bearer_pattern is not None and ("Bearer " in value or "bearer " in value):
+        if self._bearer_pattern is not None and "bearer " in value.lower():
             value = self._bearer_pattern.sub("Bearer ***", value)
         for pattern in self.patterns:
             value = pattern.sub("***", value)
