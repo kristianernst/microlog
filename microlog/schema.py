@@ -5,10 +5,10 @@ import logging
 import traceback
 from typing import Any
 
-_COMPACT_JSON_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), default=str)
-
 from . import otel as _otel
 from .config import LogConfig, MICROLOG_FIELDS, safe_fields, service_fields, severity_number
+
+_COMPACT_JSON_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def base_payload_fields(
