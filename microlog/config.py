@@ -5,6 +5,7 @@ import logging
 from typing import Any, Mapping
 
 MICROLOG_FIELDS = "_microlog"
+SCHEMA_VERSION = "1"
 DEFAULT_REDACT_KEYS = frozenset(
     {
         "password",
@@ -19,6 +20,7 @@ DEFAULT_REDACT_KEYS = frozenset(
 )
 RESERVED_FIELDS = frozenset(
     {
+        "schema_version",
         "time",
         "severity_text",
         "severity_number",
@@ -52,9 +54,10 @@ def _redact_keys() -> set[str]:
 def safe_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     if not fields:
         return {}
-    if not RESERVED_FIELDS.intersection(fields):
-        return dict(fields)
-    return {key: value for key, value in fields.items() if key not in RESERVED_FIELDS}
+    for key in fields:
+        if key in RESERVED_FIELDS:
+            return {key: value for key, value in fields.items() if key not in RESERVED_FIELDS}
+    return dict(fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +128,10 @@ class LogConfig:
 
 
 def service_fields(cfg: LogConfig, *, include_static: bool = False) -> dict[str, Any]:
-    fields: dict[str, Any] = {"service.name": cfg.service_name}
+    fields: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "service.name": cfg.service_name,
+    }
     if cfg.service_version:
         fields["service.version"] = cfg.service_version
     if cfg.environment:

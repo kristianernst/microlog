@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import atexit
 import errno
-import json
 import logging
 import os
 import socket
 import stat
 import sys
-import traceback
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,10 +23,8 @@ from .config import (
     StdoutConfig,
     MICROLOG_FIELDS,
     resolve_level,
-    safe_fields,
-    service_fields,
-    severity_number,
 )
+from .schema import base_payload_fields, event_payload, json_dumps
 from .scrub import Redactor, escape_control_chars
 
 try:
@@ -48,6 +44,7 @@ _listener: QueueListener | None = None
 _active_queue: Queue[logging.LogRecord] | None = None
 _listener_lock = Lock()
 _stats_lock = Lock()
+_iso_utc_cache: tuple[int | None, str] = (None, "")
 _stats: dict[str, int] = {
     "queued_records": 0,
     "dropped_records": 0,
@@ -99,70 +96,23 @@ def reset_runtime_stats() -> None:
 
 
 def _isoformat(ts: float, use_utc: bool) -> str:
-    dt = datetime.fromtimestamp(ts, timezone.utc if use_utc else None)
-    text = dt.isoformat()
-    return text.replace("+00:00", "Z") if use_utc and text.endswith("+00:00") else text
+    if not use_utc:
+        return datetime.fromtimestamp(ts).isoformat()
 
+    global _iso_utc_cache
+    second = int(ts)
+    micros = int(round((ts - second) * 1_000_000))
+    if micros >= 1_000_000:
+        second += 1
+        micros = 0
 
-def _json_dumps(payload: dict[str, Any], indent: int | None) -> str:
-    if _ORJSON is not None:
-        try:
-            if indent is None:
-                return _ORJSON.dumps(payload, default=str).decode("utf-8")
-            if indent == 2:
-                return _ORJSON.dumps(payload, default=str, option=_ORJSON.OPT_INDENT_2).decode(
-                    "utf-8"
-                )
-        except Exception:
-            pass
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":") if indent is None else None,
-        indent=indent,
-        default=str,
-    )
-
-
-def _record_fields(record: logging.LogRecord, cfg: LogConfig) -> dict[str, Any]:
-    fields: dict[str, Any] = {
-        "time": _isoformat(record.created, cfg.utc),
-        "severity_text": record.levelname,
-        "severity_number": severity_number(record.levelno),
-        "body": record.getMessage(),
-    }
-    if cfg.include_logger_name:
-        fields["logger.name"] = record.name
-    if cfg.include_thread:
-        fields["thread.name"] = record.threadName
-    if cfg.include_code:
-        fields.update(
-            {
-                "code.file.path": record.pathname,
-                "code.function.name": record.funcName,
-                "code.line.number": record.lineno,
-            }
-        )
-    return fields
-
-
-def _record_payload(record: logging.LogRecord) -> dict[str, Any]:
-    if isinstance(payload := getattr(record, MICROLOG_FIELDS, None), dict):
-        return safe_fields(payload)
-    return safe_fields(
-        {key: value for key, value in record.__dict__.items() if key not in _SKIP_EXTRA_KEYS}
-    )
-
-
-def _error_fields(record: logging.LogRecord) -> dict[str, Any]:
-    if record.exc_info:
-        etype, evalue, etb = record.exc_info
-        return {
-            "exception.type": getattr(etype, "__name__", str(etype)),
-            "exception.message": str(evalue),
-            "exception.stacktrace": "".join(traceback.format_exception(etype, evalue, etb)).strip(),
-        }
-    return {"stack": str(record.stack_info)} if record.stack_info else {}
+    cache_second, cache_prefix = _iso_utc_cache
+    if cache_second != second:
+        cache_prefix = datetime.fromtimestamp(second, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        _iso_utc_cache = (second, cache_prefix)
+    if micros:
+        return f"{cache_prefix}.{micros:06d}Z"
+    return f"{cache_prefix}Z"
 
 
 def _close_handlers(handlers: Iterable[logging.Handler]) -> None:
@@ -193,37 +143,29 @@ def _clear_listener_state(listener: QueueListener | None) -> None:
             _active_queue = None
 
 
-def _event_payload(
-    record: logging.LogRecord, cfg: LogConfig, base: dict[str, Any]
-) -> dict[str, Any]:
-    payload = dict(base)
-    for fields in (
-        _record_fields(record, cfg),
-        _otel._extract_otel_context(record, cfg.try_opentelemetry),
-        _record_payload(record),
-        _error_fields(record),
-    ):
-        payload.update(fields)
-    return {key: value for key, value in payload.items() if value is not None}
-
-
 class JsonFormatter(logging.Formatter):
     def __init__(self, cfg: LogConfig):
         super().__init__()
         self._cfg = cfg
-        self._base = service_fields(cfg, include_static=True)
-        if cfg.include_host:
-            self._base["host.name"] = socket.gethostname()
-        if cfg.include_pid:
-            self._base["process.pid"] = os.getpid()
+        self._base = base_payload_fields(
+            cfg,
+            host_name=socket.gethostname() if cfg.include_host else None,
+            process_id=os.getpid() if cfg.include_pid else None,
+        )
         self._redactor = Redactor(cfg.redact_keys, cfg.redact_value_patterns)
         self._should_scrub = bool(self._redactor.keys or self._redactor.patterns)
 
     def format(self, record: logging.LogRecord) -> str:
-        payload = _event_payload(record, self._cfg, self._base)
+        payload = event_payload(
+            record,
+            self._cfg,
+            base_fields=self._base,
+            timestamp=_isoformat(record.created, self._cfg.utc),
+            skip_extra_keys=_SKIP_EXTRA_KEYS,
+        )
         if self._should_scrub:
             payload = cast(dict[str, Any], self._redactor.scrub(payload))
-        return _json_dumps(payload, self._cfg.json_indent)
+        return json_dumps(payload, self._cfg.json_indent, orjson_impl=_ORJSON)
 
 
 class DevColorFormatter(logging.Formatter):
@@ -482,6 +424,11 @@ def _build_handlers(cfg: LogConfig) -> list[logging.Handler]:
 
 def configure_logging(cfg: LogConfig) -> None:
     global _listener, _active_queue
+
+    logging.logThreads = bool(cfg.include_thread)
+    logging.logProcesses = bool(cfg.include_pid)
+    if hasattr(logging, "logMultiprocessing"):
+        logging.logMultiprocessing = bool(cfg.include_pid)
 
     root = logging.getLogger()
     resolved_root_level = resolve_level(cfg.level)

@@ -38,6 +38,7 @@ class Redactor:
     def __init__(self, keys: Iterable[str], patterns: Iterable[str]):
         self.keys = {str(key).strip().lower() for key in keys if str(key).strip()}
         self.patterns = _compile_patterns(patterns)
+        self._key_matches: dict[str, bool] = {}
         inline_keys = sorted(
             {variant for key in self.keys for variant in _inline_key_variants(key)}
         )
@@ -55,20 +56,40 @@ class Redactor:
         )
 
     def scrub(self, value: Any) -> Any:
+        scrub_text = self.scrub_text
+        scrub = self.scrub
         if isinstance(value, dict):
+            keys = self.keys
+            key_matches = self._key_matches
             mapping = cast(dict[Any, Any], value)
-            return {
-                key: "***" if str(key).lower() in self.keys else self.scrub(item)
-                for key, item in mapping.items()
-            }
+            scrubbed: dict[Any, Any] = {}
+            for key, item in mapping.items():
+                if isinstance(key, str):
+                    key_match = key_matches.get(key)
+                    if key_match is None:
+                        key_match = key.lower() in keys
+                        key_matches[key] = key_match
+                else:
+                    key_match = str(key).lower() in keys
+                if key_match:
+                    scrubbed[key] = "***"
+                elif isinstance(item, str):
+                    scrubbed[key] = scrub_text(item)
+                elif isinstance(item, dict):
+                    scrubbed[key] = scrub(item)
+                elif isinstance(item, (list, tuple, set, frozenset)):
+                    scrubbed[key] = [scrub(entry) for entry in cast(Iterable[Any], item)]
+                else:
+                    scrubbed[key] = item
+            return scrubbed
         if isinstance(value, (list, tuple, set, frozenset)):
-            return [self.scrub(item) for item in cast(Iterable[Any], value)]
+            return [scrub_text(item) if isinstance(item, str) else scrub(item) for item in cast(Iterable[Any], value)]
         if isinstance(value, str):
-            return self.scrub_text(value)
+            return scrub_text(value)
         return value
 
     def scrub_text(self, value: str) -> str:
-        if self._inline_key_pattern is not None:
+        if self._inline_key_pattern is not None and (":" in value or "=" in value):
             value = self._inline_key_pattern.sub(
                 lambda match: (
                     f"{match.group('prefix')}{match.group('key')}{match.group('sep')}"
@@ -76,7 +97,7 @@ class Redactor:
                 ),
                 value,
             )
-        if self._bearer_pattern is not None:
+        if self._bearer_pattern is not None and "bearer " in value.lower():
             value = self._bearer_pattern.sub("Bearer ***", value)
         for pattern in self.patterns:
             value = pattern.sub("***", value)
