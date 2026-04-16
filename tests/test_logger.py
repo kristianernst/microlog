@@ -57,6 +57,19 @@ def stub_http_otlp_exporter(monkeypatch: Any):
     return DummyExporter
 
 
+def stub_requests(monkeypatch: Any):
+    class DummySession:
+        def __init__(self) -> None:
+            self.verify = True
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(Session=DummySession))
+    return DummySession
+
+
 def test_configure_logging_requires_handler() -> None:
     cfg = LogConfig(stdout=None, file=None)
     with pytest.raises(ValueError):
@@ -483,13 +496,17 @@ def test_http_otlp_exporter_disables_tls_verification_only_when_explicit(
     monkeypatch: Any,
 ) -> None:
     stub_http_otlp_exporter(monkeypatch)
+    session_type = stub_requests(monkeypatch)
     exporter, cleanup = microlog_otel._build_otlp_exporter(  # pyright: ignore[reportPrivateUsage]
         "http/protobuf",
         OTLPConfig(endpoint="https://collector.example/v1/logs", insecure=True),
     )
     assert cleanup is not None
-    assert exporter.kwargs["session"].verify is False
+    session = exporter.kwargs["session"]
+    assert isinstance(session, session_type)
+    assert session.verify is False
     cleanup()
+    assert session.closed is True
 
 
 def test_otlp_handler_resolves_level_without_optional_sdk(monkeypatch: Any) -> None:
